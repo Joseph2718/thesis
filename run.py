@@ -6,14 +6,17 @@ import numpy as np
 import time
 import tensorflow as tf
 import json
+import os
 
 import algorithms.PLRank as plr
 import algorithms.pairwise as pw
 import algorithms.lambdaloss as ll
 import algorithms.tensorflowloss as tfl
+import utils.plackettluce as pl
 import utils.dataset as dataset
 import utils.nnmodel as nn
 import utils.evaluate as evl
+import utils.experiment_utils as exu
 
 parser = argparse.ArgumentParser()
 parser.add_argument("output_path", type=str,
@@ -41,6 +44,13 @@ parser.add_argument("--timed", action='store_true',
                     help="Turns off evaluation so method can be timed.")
 parser.add_argument("--vali", action='store_true',
                     help="Results calculated on the validation set.")
+parser.add_argument("--reward_type", type=str, default="existing",
+                    choices=["existing", "toy_set"],
+                    help="Reward definition to use for stochastic ranking losses.")
+parser.add_argument("--reward_lambda", type=float, default=0.0,
+                    help="Redundancy penalty weight for toy_set reward.")
+parser.add_argument("--max_steps", type=int, default=None,
+                    help="Optional hard cap on optimization steps for smoke tests.")
 
 args = parser.parse_args()
 
@@ -49,6 +59,9 @@ num_samples = args.num_samples
 num_eval_samples = args.num_eval_samples
 timed_run = args.timed
 validation_results = args.vali
+reward_type = args.reward_type
+reward_lambda = args.reward_lambda
+max_steps = args.max_steps
 
 if num_samples == 'dynamic':
   dynamic_samples = True
@@ -68,6 +81,9 @@ if timed_run:
   elif args.dataset == 'istella':
     n_epochs = 40
     max_time = 15000
+  else:
+    n_epochs = 20
+    max_time = 3600
 else:
   if args.dataset == 'Webscope_C14_Set1':
     n_epochs = 40
@@ -77,6 +93,8 @@ else:
     n_epochs = 40
   elif args.dataset == 'istella':
     n_epochs = 40
+  else:
+    n_epochs = 20
 
 data = dataset.get_dataset_from_json_info(
                   args.dataset,
@@ -98,6 +116,23 @@ model = nn.init_model(model_params)
 optimizer = tf.keras.optimizers.SGD(learning_rate=model_params['learning_rate'])
 
 results = []
+if args.loss in ('policygradient', 'placementpolicygradient'):
+  estimator_name = 'reinforce'
+else:
+  estimator_name = 'plrank'
+run_timestamp = time.strftime('%Y%m%d_%H%M%S')
+run_csv_path = os.path.join('runs', '%s_%s_%s.csv' % (run_timestamp, reward_type, estimator_name))
+step_logger = exu.CSVLogger(run_csv_path,
+                            ['step',
+                             'epoch',
+                             'step_time_sec',
+                             'cumulative_reward_eval_count',
+                             'reward',
+                             'grad_norm',
+                             'estimator',
+                             'loss',
+                             'reward_type',
+                             'num_samples'])
 
 metric_weights = 1./np.log2(np.arange(max_ranking_size) + 2)
 train_labels = 2**data.train.label_vector-1
@@ -120,9 +155,16 @@ if dynamic_samples:
   max_num_samples = 100
 steps = 0
 next_check = 0
+reward_eval_count = 0
+stop_training = False
 for epoch_i in range(n_epochs):
   query_permutation = np.random.permutation(n_queries)
   for qid in query_permutation:
+    step_start_time = time.time()
+    step_reward = np.nan
+    step_reward_evals = 0
+    grad_norm = 0.0
+
     q_labels =  data.train.query_values_from_vector(
                               qid, train_labels)
     q_feat = data.train.query_feat(qid)
@@ -132,59 +174,168 @@ for epoch_i in range(n_epochs):
       q_metric_weights = metric_weights #/q_ideal_metric #uncomment for NDCG
       with tf.GradientTape() as tape:
         q_tf_scores = model(q_feat)
+        q_np_scores = q_tf_scores.numpy()[:,0]
+        q_cutoff = min(max_ranking_size, q_labels.shape[0])
+        q_metric_weights = metric_weights[:q_cutoff]
+        if reward_type == 'toy_set':
+          q_labels_train = exu.compute_toy_doc_relevance(q_labels, q_feat, reward_lambda)
+        else:
+          q_labels_train = q_labels
 
         last_method_train_time = time.time()
         if args.loss == 'policygradient':
-          loss = tfl.policy_gradient(
-                                    q_metric_weights,
-                                    q_labels,
-                                    q_tf_scores,
-                                    n_samples=num_samples
-                                    )
+          if reward_type == 'toy_set':
+            sampled_rankings = pl.gumbel_sample_rankings(
+                                        q_np_scores,
+                                        num_samples,
+                                        cutoff=q_cutoff)[0]
+            sampled_rewards = np.array(
+                                [exu.compute_toy_set_reward(q_metric_weights,
+                                                            q_labels,
+                                                            q_feat,
+                                                            ranking,
+                                                            reward_lambda=reward_lambda,
+                                                            topk=q_cutoff)
+                                 for ranking in sampled_rankings],
+                                dtype=np.float64)
+            step_reward = float(np.mean(sampled_rewards))
+            step_reward_evals += sampled_rewards.shape[0]
+            loss = tfl.policy_gradient(
+                                      q_metric_weights,
+                                      q_labels_train,
+                                      q_tf_scores,
+                                      sampled_rankings=sampled_rankings,
+                                      sampled_rewards=sampled_rewards
+                                      )
+          else:
+            loss = tfl.policy_gradient(
+                                      q_metric_weights,
+                                      q_labels_train,
+                                      q_tf_scores,
+                                      n_samples=num_samples
+                                      )
+            step_reward_evals += num_samples
+            sampled_ranking = pl.gumbel_sample_rankings(
+                                        q_np_scores,
+                                        1,
+                                        cutoff=q_cutoff)[0][0]
+            step_reward = exu.compute_existing_reward(
+                                      q_metric_weights,
+                                      q_labels,
+                                      sampled_ranking,
+                                      topk=q_cutoff)
+            step_reward_evals += 1
           method_train_time += time.time() - last_method_train_time
         elif args.loss == 'placementpolicygradient':
-          loss = tfl.placement_policy_gradient(
-                                    q_metric_weights,
-                                    q_labels,
-                                    q_tf_scores,
-                                    n_samples=num_samples
-                                    )
+          if reward_type == 'toy_set':
+            sampled_rankings = pl.gumbel_sample_rankings(
+                                        q_np_scores,
+                                        num_samples,
+                                        cutoff=q_cutoff)[0]
+            sampled_rewards = np.array(
+                                [exu.compute_toy_set_reward(q_metric_weights,
+                                                            q_labels,
+                                                            q_feat,
+                                                            ranking,
+                                                            reward_lambda=reward_lambda,
+                                                            topk=q_cutoff)
+                                 for ranking in sampled_rankings],
+                                dtype=np.float64)
+            step_reward = float(np.mean(sampled_rewards))
+            step_reward_evals += sampled_rewards.shape[0]
+            loss = tfl.placement_policy_gradient(
+                                      q_metric_weights,
+                                      q_labels_train,
+                                      q_tf_scores,
+                                      sampled_rankings=sampled_rankings,
+                                      sampled_rewards=sampled_rewards
+                                      )
+          else:
+            loss = tfl.placement_policy_gradient(
+                                      q_metric_weights,
+                                      q_labels_train,
+                                      q_tf_scores,
+                                      n_samples=num_samples
+                                      )
+            step_reward_evals += num_samples
+            sampled_ranking = pl.gumbel_sample_rankings(
+                                        q_np_scores,
+                                        1,
+                                        cutoff=q_cutoff)[0][0]
+            step_reward = exu.compute_existing_reward(
+                                      q_metric_weights,
+                                      q_labels,
+                                      sampled_ranking,
+                                      topk=q_cutoff)
+            step_reward_evals += 1
           method_train_time += time.time() - last_method_train_time
         else:
-          q_np_scores = q_tf_scores.numpy()[:,0]
           if args.loss == 'pairwise':
-            doc_weights = pw.pairwise(q_labels,
+            doc_weights = pw.pairwise(q_labels_train,
                                       q_np_scores,
                                       )
           elif args.loss == 'lambdaloss':
             doc_weights = ll.lambdaloss(
                                       q_metric_weights,
-                                      q_labels,
+                                      q_labels_train,
                                       q_np_scores,
                                       n_samples=num_samples
                                       )
           elif args.loss == 'PL_rank_1':
             doc_weights = plr.PL_rank_1(
                                       q_metric_weights,
-                                      q_labels,
+                                      q_labels_train,
                                       q_np_scores,
                                       n_samples=num_samples)
           elif args.loss == 'PL_rank_2':
             doc_weights = plr.PL_rank_2(
                                       q_metric_weights,
-                                      q_labels,
+                                      q_labels_train,
                                       q_np_scores,
                                       n_samples=num_samples)
           else:
             raise NotImplementedError('Unknown loss %s' % args.loss)
           method_train_time += time.time() - last_method_train_time
+          sampled_ranking = pl.gumbel_sample_rankings(
+                                      q_np_scores,
+                                      1,
+                                      cutoff=q_cutoff)[0][0]
+          if reward_type == 'toy_set':
+            step_reward = exu.compute_toy_set_reward(
+                                      q_metric_weights,
+                                      q_labels,
+                                      q_feat,
+                                      sampled_ranking,
+                                      reward_lambda=reward_lambda,
+                                      topk=q_cutoff)
+          else:
+            step_reward = exu.compute_existing_reward(
+                                      q_metric_weights,
+                                      q_labels,
+                                      sampled_ranking,
+                                      topk=q_cutoff)
+          step_reward_evals += 1
 
           loss = -tf.reduce_sum(q_tf_scores[:,0] * doc_weights)
 
       gradients = tape.gradient(loss, model.trainable_variables)
+      grad_norm = exu.compute_global_grad_norm(gradients)
       optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
     steps += 1
+    reward_eval_count += step_reward_evals
+    step_logger.log({
+        'step': steps,
+        'epoch': steps/float(n_queries),
+        'step_time_sec': time.time() - step_start_time,
+        'cumulative_reward_eval_count': reward_eval_count,
+        'reward': step_reward,
+        'grad_norm': grad_norm,
+        'estimator': estimator_name,
+        'loss': args.loss,
+        'reward_type': reward_type,
+        'num_samples': num_samples,
+    })
     if dynamic_samples:
       float_num_samples = 10 + steps*add_per_step
       num_samples = min(int(np.round(float_num_samples)), max_num_samples)
@@ -226,7 +377,13 @@ for epoch_i in range(n_epochs):
       last_total_train_time = time.time()
 
     if timed_run and (time.time() - real_start_time) > max_time:
+      stop_training = True
       break
+    if max_steps is not None and steps >= max_steps:
+      stop_training = True
+      break
+  if stop_training:
+    break
 
 output = {
   'dataset': args.dataset,
@@ -238,10 +395,16 @@ output = {
   'number of samples': num_samples,
   'number of evaluation samples': num_eval_samples,
   'cutoff': cutoff,
+  'reward type': reward_type,
+  'reward lambda': reward_lambda,
+  'estimator': estimator_name,
+  'csv log path': run_csv_path,
 }
 if dynamic_samples:
   output['number of samples'] = 'dynamic'
 
+step_logger.close()
+print('Wrote per-step logs to %s' % run_csv_path)
 print('Writing results to %s' % args.output_path)
 with open(args.output_path, 'w') as f:
   json.dump(output, f)

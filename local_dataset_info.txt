@@ -1,0 +1,12 @@
+{
+  "TinyToy": {
+    "num_folds": 1,
+    "fold_paths": [
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/toy/Fold1/"
+    ],
+    "num_relevance_labels": 5,
+    "num_nonzero_feat": 3,
+    "num_unique_feat": 3,
+    "query_normalized": false
+  }
+}
