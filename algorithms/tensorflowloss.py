@@ -5,7 +5,7 @@ import tensorflow as tf
 import numpy as np
 import utils.plackettluce as pl
 
-def placement_policy_gradient(rank_weights, labels, scores, n_samples=None, sampled_rankings=None, sampled_rewards=None):
+def placement_policy_gradient(rank_weights, labels, scores, n_samples=None, sampled_rankings=None, sampled_rewards=None, sampled_following_rewards=None):
   n_docs = labels.shape[0]
   result = np.zeros(n_docs, dtype=np.float64)
   cutoff = min(rank_weights.shape[0], n_docs)
@@ -38,11 +38,14 @@ def placement_policy_gradient(rank_weights, labels, scores, n_samples=None, samp
   sample_denom = tf.reduce_logsumexp(tiled_scores, axis=2)
   sample_log_prob = sampled_scores-sample_denom
 
-  if sampled_rewards is None:
+  if sampled_following_rewards is not None:
+    cum_rewards = sampled_following_rewards
+  elif sampled_rewards is None:
     rewards = rank_weights[None,:cutoff]*labels[sampled_rankings]
+    cum_rewards = tf.cumsum(rewards, axis=1, reverse=True)
   else:
     rewards = sampled_rewards[:, None]
-  cum_rewards = tf.cumsum(rewards, axis=1, reverse=True)
+    cum_rewards = tf.cumsum(rewards, axis=1, reverse=True)
   
   result = tf.reduce_sum(tf.reduce_mean(
                   sample_log_prob*cum_rewards, axis=0))

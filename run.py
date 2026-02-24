@@ -47,6 +47,11 @@ parser.add_argument("--vali", action='store_true',
 parser.add_argument("--reward_type", type=str, default="existing",
                     choices=["existing", "toy_set"],
                     help="Reward definition to use for stochastic ranking losses.")
+parser.add_argument("--objective", type=str, default="auto",
+                    choices=["auto", "set_utility", "dcg", "dcg_surrogate_from_toy_set"],
+                    help=("Training objective. set_utility is only supported for "
+                          "policygradient/placementpolicygradient; PL-Rank style "
+                          "losses require dcg or dcg_surrogate_from_toy_set."))
 parser.add_argument("--reward_lambda", type=float, default=0.0,
                     help="Redundancy penalty weight for toy_set reward.")
 parser.add_argument("--max_steps", type=int, default=None,
@@ -60,8 +65,10 @@ num_eval_samples = args.num_eval_samples
 timed_run = args.timed
 validation_results = args.vali
 reward_type = args.reward_type
+objective = exu.resolve_objective(args.loss, reward_type, args.objective)
 reward_lambda = args.reward_lambda
 max_steps = args.max_steps
+exu.validate_objective_for_loss(args.loss, objective)
 
 if num_samples == 'dynamic':
   dynamic_samples = True
@@ -121,7 +128,7 @@ if args.loss in ('policygradient', 'placementpolicygradient'):
 else:
   estimator_name = 'plrank'
 run_timestamp = time.strftime('%Y%m%d_%H%M%S')
-run_csv_path = os.path.join('runs', '%s_%s_%s.csv' % (run_timestamp, reward_type, estimator_name))
+run_csv_path = os.path.join('runs', '%s_%s_%s_%s.csv' % (run_timestamp, objective, reward_type, estimator_name))
 step_logger = exu.CSVLogger(run_csv_path,
                             ['step',
                              'epoch',
@@ -131,6 +138,7 @@ step_logger = exu.CSVLogger(run_csv_path,
                              'grad_norm',
                              'estimator',
                              'loss',
+                             'objective',
                              'reward_type',
                              'num_samples'])
 
@@ -177,25 +185,41 @@ for epoch_i in range(n_epochs):
         q_np_scores = q_tf_scores.numpy()[:,0]
         q_cutoff = min(max_ranking_size, q_labels.shape[0])
         q_metric_weights = metric_weights[:q_cutoff]
-        if reward_type == 'toy_set':
-          q_labels_train = exu.compute_toy_doc_relevance(q_labels, q_feat, reward_lambda)
-        else:
+
+        if objective == 'set_utility':
           q_labels_train = q_labels
+        else:
+          q_labels_train = exu.get_decomposable_gains(
+                              objective,
+                              q_metric_weights,
+                              q_labels,
+                              q_feat,
+                              reward_lambda=reward_lambda)
+
+        def compute_set_reward(ranking):
+          if reward_type == 'toy_set':
+            return exu.compute_toy_set_reward(
+                          q_metric_weights,
+                          q_labels,
+                          q_feat,
+                          ranking,
+                          reward_lambda=reward_lambda,
+                          topk=q_cutoff)
+          return exu.compute_existing_reward(
+                        q_metric_weights,
+                        q_labels,
+                        ranking,
+                        topk=q_cutoff)
 
         last_method_train_time = time.time()
         if args.loss == 'policygradient':
-          if reward_type == 'toy_set':
+          if objective == 'set_utility':
             sampled_rankings = pl.gumbel_sample_rankings(
                                         q_np_scores,
                                         num_samples,
                                         cutoff=q_cutoff)[0]
             sampled_rewards = np.array(
-                                [exu.compute_toy_set_reward(q_metric_weights,
-                                                            q_labels,
-                                                            q_feat,
-                                                            ranking,
-                                                            reward_lambda=reward_lambda,
-                                                            topk=q_cutoff)
+                                [compute_set_reward(ranking)
                                  for ranking in sampled_rankings],
                                 dtype=np.float64)
             step_reward = float(np.mean(sampled_rewards))
@@ -219,36 +243,35 @@ for epoch_i in range(n_epochs):
                                         q_np_scores,
                                         1,
                                         cutoff=q_cutoff)[0][0]
-            step_reward = exu.compute_existing_reward(
-                                      q_metric_weights,
-                                      q_labels,
-                                      sampled_ranking,
-                                      topk=q_cutoff)
+            step_reward = compute_set_reward(sampled_ranking)
             step_reward_evals += 1
           method_train_time += time.time() - last_method_train_time
         elif args.loss == 'placementpolicygradient':
-          if reward_type == 'toy_set':
+          if objective == 'set_utility':
             sampled_rankings = pl.gumbel_sample_rankings(
                                         q_np_scores,
                                         num_samples,
                                         cutoff=q_cutoff)[0]
-            sampled_rewards = np.array(
-                                [exu.compute_toy_set_reward(q_metric_weights,
+            sampled_following_rewards = np.array(
+                                [exu.compute_following_reward_vector(
+                                                            q_metric_weights,
                                                             q_labels,
                                                             q_feat,
                                                             ranking,
+                                                            reward_type=reward_type,
                                                             reward_lambda=reward_lambda,
                                                             topk=q_cutoff)
                                  for ranking in sampled_rankings],
                                 dtype=np.float64)
+            sampled_rewards = sampled_following_rewards[:, 0] if sampled_following_rewards.size > 0 else np.zeros(sampled_rankings.shape[0], dtype=np.float64)
             step_reward = float(np.mean(sampled_rewards))
-            step_reward_evals += sampled_rewards.shape[0]
+            step_reward_evals += sampled_following_rewards.shape[0] * q_cutoff
             loss = tfl.placement_policy_gradient(
                                       q_metric_weights,
                                       q_labels_train,
                                       q_tf_scores,
                                       sampled_rankings=sampled_rankings,
-                                      sampled_rewards=sampled_rewards
+                                      sampled_following_rewards=sampled_following_rewards
                                       )
           else:
             loss = tfl.placement_policy_gradient(
@@ -262,11 +285,7 @@ for epoch_i in range(n_epochs):
                                         q_np_scores,
                                         1,
                                         cutoff=q_cutoff)[0][0]
-            step_reward = exu.compute_existing_reward(
-                                      q_metric_weights,
-                                      q_labels,
-                                      sampled_ranking,
-                                      topk=q_cutoff)
+            step_reward = compute_set_reward(sampled_ranking)
             step_reward_evals += 1
           method_train_time += time.time() - last_method_train_time
         else:
@@ -300,20 +319,7 @@ for epoch_i in range(n_epochs):
                                       q_np_scores,
                                       1,
                                       cutoff=q_cutoff)[0][0]
-          if reward_type == 'toy_set':
-            step_reward = exu.compute_toy_set_reward(
-                                      q_metric_weights,
-                                      q_labels,
-                                      q_feat,
-                                      sampled_ranking,
-                                      reward_lambda=reward_lambda,
-                                      topk=q_cutoff)
-          else:
-            step_reward = exu.compute_existing_reward(
-                                      q_metric_weights,
-                                      q_labels,
-                                      sampled_ranking,
-                                      topk=q_cutoff)
+          step_reward = compute_set_reward(sampled_ranking)
           step_reward_evals += 1
 
           loss = -tf.reduce_sum(q_tf_scores[:,0] * doc_weights)
@@ -333,6 +339,7 @@ for epoch_i in range(n_epochs):
         'grad_norm': grad_norm,
         'estimator': estimator_name,
         'loss': args.loss,
+        'objective': objective,
         'reward_type': reward_type,
         'num_samples': num_samples,
     })
@@ -395,6 +402,7 @@ output = {
   'number of samples': num_samples,
   'number of evaluation samples': num_eval_samples,
   'cutoff': cutoff,
+  'objective': objective,
   'reward type': reward_type,
   'reward lambda': reward_lambda,
   'estimator': estimator_name,

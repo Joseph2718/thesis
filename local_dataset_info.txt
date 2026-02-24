@@ -8,5 +8,19 @@
     "num_nonzero_feat": 3,
     "num_unique_feat": 3,
     "query_normalized": false
+  },
+  "MSLR-WEB10k": {
+    "num_folds": 5,
+    "fold_paths": [
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/MSLR-WEB10K/Fold1/",
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/MSLR-WEB10K/Fold2/",
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/MSLR-WEB10K/Fold3/",
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/MSLR-WEB10K/Fold4/",
+      "/Users/josephop/2021-SIGIR-plackett-luce-1/data/MSLR-WEB10K/Fold5/"
+    ],
+    "num_relevance_labels": 5,
+    "num_nonzero_feat": 136,
+    "num_unique_feat": 131,
+    "query_normalized": false
   }
 }

@@ -1,1 +1,0 @@
-step,epoch,step_time_sec,cumulative_reward_eval_count,reward,grad_norm,estimator,loss,reward_type,num_samples
