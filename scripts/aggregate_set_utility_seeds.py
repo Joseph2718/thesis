@@ -304,6 +304,25 @@ def main():
   pl_row, pl_curves = _aggregate_method(
       'plrank_surrogate', args.seed_dirs, common_time_budget, common_total_fw_budget, common_online_fw_budget)
   rows = [pg_row, pl_row]
+
+  baseline_utils = []
+  baseline_ems = []
+  baseline_f1s = []
+  for seed_dir in args.seed_dirs:
+    summary_rows = _read_summary(os.path.join(seed_dir, 'summary_table.csv'))
+    bl = [r for r in summary_rows if r['method'] == 'topk_retriever_baseline']
+    if bl:
+      baseline_utils.append(float(bl[0]['final_heldout_utility']))
+      baseline_ems.append(float(bl[0]['final_heldout_em_approx']))
+      baseline_f1s.append(float(bl[0]['final_heldout_f1_approx']))
+  if baseline_utils:
+    bl_row = {k: '' for k in rows[0]}
+    bl_row['method'] = 'topk_retriever_baseline'
+    bl_row['n_seeds'] = len(baseline_utils)
+    bl_row['final_heldout_utility_mean_std'] = _fmt_mean_std(baseline_utils)
+    bl_row['approx_em_mean_std'] = _fmt_mean_std(baseline_ems)
+    bl_row['approx_f1_mean_std'] = _fmt_mean_std(baseline_f1s)
+    rows.append(bl_row)
   for row in rows:
     row['common_time_budget_ms'] = '%.3f' % common_time_budget
     row['common_total_forward_pass_budget'] = '%.0f' % common_total_fw_budget

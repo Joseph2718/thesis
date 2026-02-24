@@ -30,7 +30,7 @@ def PL_rank_1(rank_weights, labels, scores, n_samples=None, sampled_rankings=Non
   ninf_mask = np.zeros((n_samples, cutoff-1, n_docs), dtype=np.float64)
   ninf_mask[srange[:,None],
             crange[None,:-1],
-            sampled_rankings[:,:-1]] = np.NINF
+            sampled_rankings[:,:-1]] = -np.inf
   ninf_mask[:,:] = np.cumsum(ninf_mask, axis=1)
 
   tiled_scores = np.tile(scores[None,None,:], (n_samples, cutoff, 1))
@@ -79,7 +79,7 @@ def PL_rank_2(rank_weights, labels, scores, n_samples=None, sampled_rankings=Non
   ninf_mask = np.zeros((n_samples, cutoff-1, n_docs), dtype=np.float64)
   ninf_mask[srange[:,None],
             crange[None,:-1],
-            sampled_rankings[:,:-1]] = np.NINF
+            sampled_rankings[:,:-1]] = -np.inf
   ninf_mask[:,:] = np.cumsum(ninf_mask, axis=1)
 
   tiled_scores = np.tile(scores[None,None,:], (n_samples, cutoff, 1))

@@ -38,7 +38,7 @@ def sample_rankings(log_scores, n_samples, cutoff=None, prob_per_rank=False):
     rankings[:, i] = sampled_ind
     inv_rankings[ind, sampled_ind] = i
     rankings_prob[:, i] = probs[ind, sampled_ind]
-    log_scores[ind, sampled_ind] = np.NINF
+    log_scores[ind, sampled_ind] = -np.inf
 
   if prob_per_rank:
     return rankings, inv_rankings, rankings_prob, rank_prob_matrix
@@ -82,7 +82,7 @@ def gumbel_sample_rankings(log_scores, n_samples, cutoff=None,
     if prob_per_rank:
       rank_prob_matrix[i, :] = np.mean(probs, axis=0)
     rankings_prob[:, i] = probs[ind, rankings[:, i]]
-    log_scores[ind, rankings[:, i]] = np.NINF
+    log_scores[ind, rankings[:, i]] = -np.inf
 
   if return_gumbel:
     gumbel_return_values = gumbel_scores

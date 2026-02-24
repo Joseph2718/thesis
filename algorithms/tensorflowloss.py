@@ -31,7 +31,7 @@ def placement_policy_gradient(rank_weights, labels, scores, n_samples=None, samp
 
   sampled_scores = tf.gather(scores, sampled_rankings)[:,:,0]
   tiled_scores = tf.tile(scores[None,None,:,0], (n_samples, cutoff, 1))
-  tiled_scores = tf.where(ninf_mask, np.NINF, tiled_scores)
+  tiled_scores = tf.where(ninf_mask, -np.inf, tiled_scores)
   max_per_rank = np.max(tiled_scores, axis=2)
   tiled_scores -= max_per_rank[:,:,None]
 
@@ -77,7 +77,7 @@ def policy_gradient(rank_weights, labels, scores, n_samples=None, sampled_rankin
 
   sampled_scores = tf.gather(scores, sampled_rankings)[:,:,0]
   tiled_scores = tf.tile(scores[None,None,:,0], (n_samples, cutoff, 1))
-  tiled_scores = tf.where(ninf_mask, np.NINF, tiled_scores)
+  tiled_scores = tf.where(ninf_mask, -np.inf, tiled_scores)
   max_per_rank = np.max(tiled_scores, axis=2)
   tiled_scores -= max_per_rank[:,:,None]
 
