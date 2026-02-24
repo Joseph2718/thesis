@@ -1,0 +1,9 @@
+# Local / generated
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# Data and run artifacts
+data/MSLR-WEB10K/
+data/MSLR-WEB30k/
+runs/
