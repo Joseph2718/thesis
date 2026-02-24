@@ -7,3 +7,9 @@
 data/MSLR-WEB10K/
 data/MSLR-WEB30k/
 runs/
+**/__pycache__/
+*.pyc
+.DS_Store
+runs/
+data/MSLR-WEB10K/
+data/MSLR-WEB30k/
