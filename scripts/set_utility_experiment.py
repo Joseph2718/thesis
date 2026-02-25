@@ -420,10 +420,13 @@ def train_one_method(method_name,
                      tokenizer,
                      generator_model,
                      device,
-                     output_csv):
+                     output_csv,
+                     debug_learnability=False):
   rank_weights = np.ones(k, dtype=np.float64)
   train_q_stream = list(range(len(train_examples)))
   rng = np.random.RandomState(13)
+  prev_params = None
+  debug_steps = []
 
   with open(output_csv, 'w', newline='') as handle:
     writer = csv.DictWriter(handle, fieldnames=[
@@ -443,6 +446,11 @@ def train_one_method(method_name,
       features = ex['features']
       n_docs = features.shape[0]
       cutoff = min(k, n_docs)
+
+      if debug_learnability:
+        cur_params = np.concatenate([w.numpy().ravel() for w in model.trainable_variables])
+        if prev_params is None:
+          prev_params = cur_params.copy()
 
       with tf.GradientTape() as tape:
         scores_tf = model(features, training=False)
@@ -486,6 +494,47 @@ def train_one_method(method_name,
       grads = tape.gradient(loss, model.trainable_variables)
       optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
+      if debug_learnability:
+        grad_norm = float(np.sqrt(sum(float(tf.reduce_sum(g**2)) for g in grads if g is not None)))
+        new_params = np.concatenate([w.numpy().ravel() for w in model.trainable_variables])
+        param_delta = float(np.linalg.norm(new_params - prev_params))
+        prev_params = new_params.copy()
+        step_debug = {
+            'method': method_name,
+            'step': step,
+            'qid': qid,
+            'n_docs': n_docs,
+            'feature_mean': float(np.mean(features)),
+            'feature_std': float(np.std(features)),
+            'feature_min': float(np.min(features)),
+            'feature_max': float(np.max(features)),
+            'feature_pct_zero': float(np.mean(features == 0) * 100),
+            'score_mean': float(np.mean(np_scores)),
+            'score_std': float(np.std(np_scores)),
+            'score_min': float(np.min(np_scores)),
+            'score_max': float(np.max(np_scores)),
+            'loss': float(loss.numpy()),
+            'grad_norm': grad_norm,
+            'param_delta_norm': param_delta,
+            'batch_utility': float(batch_utility),
+        }
+        if method_name == 'policygradient':
+          step_debug['reward_mean'] = float(np.mean(sampled_rewards))
+          step_debug['reward_std'] = float(np.std(sampled_rewards))
+          step_debug['reward_min'] = float(np.min(sampled_rewards))
+          step_debug['reward_max'] = float(np.max(sampled_rewards))
+        elif method_name == 'plrank_surrogate':
+          step_debug['singleton_gains_mean'] = float(np.mean(gains))
+          step_debug['singleton_gains_std'] = float(np.std(gains))
+          step_debug['singleton_gains_min'] = float(np.min(gains))
+          step_debug['singleton_gains_max'] = float(np.max(gains))
+          step_debug['doc_weights_mean'] = float(np.mean(doc_weights))
+          step_debug['doc_weights_std'] = float(np.std(doc_weights))
+        debug_steps.append(step_debug)
+        print('[DEBUG %s step=%d] feat_dim=%d feat_std=%.4f | score_std=%.4f | loss=%.6f | grad_norm=%.6f | param_delta=%.6f | utility=%.4f' % (
+            method_name, step, features.shape[1], step_debug['feature_std'],
+            step_debug['score_std'], step_debug['loss'], grad_norm, param_delta, batch_utility))
+
       heldout_utility = ''
       heldout_em_approx = ''
       heldout_f1_approx = ''
@@ -512,6 +561,8 @@ def train_one_method(method_name,
           'cumulative_time_ms': (time.perf_counter() - start) * 1000.0,
       })
       handle.flush()
+
+  return debug_steps
 
 
 def read_eval_points(csv_path):
@@ -593,6 +644,11 @@ def main():
                       help='Dropout rate between hidden layers (0 = no dropout).')
   parser.add_argument('--data_seed', type=int, default=42,
                       help='Seed for data subset selection (held fixed across runs to isolate optimizer variance).')
+  parser.add_argument('--debug_learnability', type=int, default=0,
+                      help='Enable learnability diagnostics (1=on). Prints feature/score/grad/reward stats per step.')
+  parser.add_argument('--feature_normalize', type=str, default='none',
+                      choices=['none', 'per_query_zscore'],
+                      help='Feature normalization: none or per_query_zscore (z-score within each query\'s docs).')
   args = parser.parse_args()
 
   os.makedirs(args.output_dir, exist_ok=True)
@@ -655,10 +711,33 @@ def main():
         seed=args.data_seed,
         encoder=encoder)
 
+  if args.feature_normalize == 'per_query_zscore':
+    eps = 1e-6
+    for examples in [train_examples, val_examples]:
+      for ex in examples:
+        feats = ex['features']
+        if feats.shape[0] > 1:
+          mu = feats.mean(axis=0, keepdims=True)
+          sigma = feats.std(axis=0, keepdims=True) + eps
+          ex['features'] = ((feats - mu) / sigma).astype(np.float32)
+    print('Applied per_query_zscore normalization (eps=%.0e)' % eps)
+
   input_dim = train_examples[0]['features'].shape[1]
   print('data_seed: %d (data subset), seed: %d (training randomness)' % (args.data_seed, args.seed))
-  print('Feature mode: %s, input_dim: %d, hidden_units: %s, dropout: %.2f' % (
-      args.feature_mode, input_dim, hidden_units, args.dropout))
+  print('Feature mode: %s, input_dim: %d, feature_normalize: %s, hidden_units: %s, dropout: %.2f' % (
+      args.feature_mode, input_dim, args.feature_normalize, hidden_units, args.dropout))
+
+  if args.debug_learnability:
+    all_feats = np.concatenate([ex['features'] for ex in train_examples[:5]], axis=0)
+    print('[DEBUG] Feature sanity (first 5 train examples, all passages):')
+    print('  shape: %s' % (all_feats.shape,))
+    print('  mean=%.6f  std=%.6f  min=%.6f  max=%.6f' %
+          (all_feats.mean(), all_feats.std(), all_feats.min(), all_feats.max()))
+    print('  pct_zero=%.2f%%' % (np.mean(all_feats == 0) * 100))
+    for d in range(min(5, all_feats.shape[1])):
+      print('  dim[%d] mean=%.6f std=%.6f' % (d, all_feats[:, d].mean(), all_feats[:, d].std()))
+    if all_feats.shape[1] > 5:
+      print('  ... (%d more feature dims)' % (all_feats.shape[1] - 5))
 
   train_ids = [ex['example_id'] for ex in train_examples]
   val_ids = [ex['example_id'] for ex in val_examples]
@@ -683,6 +762,14 @@ def main():
       singleton_gain_transform=args.singleton_gain_transform)
   pl_singleton_precompute_forward_passes = utility_evaluator_pl.reward_forward_passes
 
+  if args.debug_learnability:
+    all_gains = np.concatenate([singleton_gains[i] for i in range(min(5, len(singleton_gains)))])
+    print('[DEBUG] Singleton gains (first 5 queries):')
+    print('  mean=%.6f  std=%.6f  min=%.6f  max=%.6f' %
+          (all_gains.mean(), all_gains.std(), all_gains.min(), all_gains.max()))
+    print('  pct_zero=%.2f%%  nonzero=%d/%d' %
+          (np.mean(all_gains == 0) * 100, np.count_nonzero(all_gains), len(all_gains)))
+
   # --- Re-seed with training seed before model init and training ---
   random.seed(args.seed)
   np.random.seed(args.seed)
@@ -699,7 +786,8 @@ def main():
 
   pg_csv = os.path.join(args.output_dir, 'train_set_utility_policygradient.csv')
   pl_csv = os.path.join(args.output_dir, 'train_set_utility_plrank_surrogate.csv')
-  train_one_method(
+  debug = bool(args.debug_learnability)
+  pg_debug = train_one_method(
       method_name='policygradient',
       model=scorer_pg,
       optimizer=opt_pg,
@@ -714,8 +802,9 @@ def main():
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
-      output_csv=pg_csv)
-  train_one_method(
+      output_csv=pg_csv,
+      debug_learnability=debug)
+  pl_debug = train_one_method(
       method_name='plrank_surrogate',
       model=scorer_pl,
       optimizer=opt_pl,
@@ -730,7 +819,14 @@ def main():
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
-      output_csv=pl_csv)
+      output_csv=pl_csv,
+      debug_learnability=debug)
+
+  if debug and (pg_debug or pl_debug):
+    debug_path = os.path.join(args.output_dir, 'debug_stats.json')
+    with open(debug_path, 'w') as f:
+      json.dump({'policygradient': pg_debug, 'plrank_surrogate': pl_debug}, f, indent=2)
+    print('Wrote debug diagnostics to %s' % debug_path)
 
   pg_points = read_eval_points(pg_csv)
   pl_points = read_eval_points(pl_csv)
