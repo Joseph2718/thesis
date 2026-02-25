@@ -256,11 +256,18 @@ def load_examples_from_candidate_pool(candidate_pool_path, max_passages, train_e
         split = 'train'
       elif split is None and ex_id.startswith('val_'):
         split = 'val'
+      feats = featurize_passages(question, passages, encoder=encoder)
+      raw_scores = row.get('scores', None)
+      if raw_scores is not None:
+        retriever_scores = np.asarray(raw_scores[:len(passages)], dtype=np.float32)
+        if retriever_scores.max() > retriever_scores.min():
+          retriever_scores = (retriever_scores - retriever_scores.min()) / (retriever_scores.max() - retriever_scores.min())
+        feats = np.concatenate([feats, retriever_scores.reshape(-1, 1)], axis=1)
       example = {
           'question': question,
           'answer': answer,
           'passages': passages,
-          'features': featurize_passages(question, passages, encoder=encoder),
+          'features': feats,
           'example_id': ex_id,
       }
       if split == 'train':
@@ -652,6 +659,13 @@ def main():
   print('data_seed: %d (data subset), seed: %d (training randomness)' % (args.data_seed, args.seed))
   print('Feature mode: %s, input_dim: %d, hidden_units: %s, dropout: %.2f' % (
       args.feature_mode, input_dim, hidden_units, args.dropout))
+
+  train_ids = [ex['example_id'] for ex in train_examples]
+  val_ids = [ex['example_id'] for ex in val_examples]
+  with open(os.path.join(args.output_dir, 'train_ids.json'), 'w') as f:
+    json.dump(train_ids, f)
+  with open(os.path.join(args.output_dir, 'val_ids.json'), 'w') as f:
+    json.dump(val_ids, f)
 
   utility_evaluator_baseline = UtilityEvaluator(
       tokenizer=tokenizer,
