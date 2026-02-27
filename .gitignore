@@ -13,3 +13,25 @@ runs/
 runs/
 data/MSLR-WEB10K/
 data/MSLR-WEB30k/
+# Large corpora / retrieval artifacts (never commit)
+data/passage_corpus/
+data/retrieval_pools/
+
+# Ignore runs by default (often huge)...
+runs/*
+# ...but keep lightweight aggregate outputs and final plots/notes
+!runs/**/aggregate_summary*.csv
+!runs/**/aggregate_notes*.txt
+!runs/**/utility_vs_*png
+!runs/**/utility_vs_*pdf
+!runs/**/variance_*pdf
+!runs/**/variance_*csv
+!runs/**/README*
+!runs/**/final_results_table.*
+
+# Keep thesis figures (do NOT ignore)
+# thesis_figures/
+
+# Big raw file types (generally avoid committing)
+*.tsv
+*.tsv.gz
