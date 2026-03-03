@@ -429,22 +429,88 @@ def _transform_singleton_gains(raw_gains, transform):
   raise ValueError('Unknown singleton gain transform: %s' % transform)
 
 
-def precompute_singleton_gains(examples, k, utility_evaluator, singleton_gain_transform):
-  rank_weights = np.ones(k, dtype=np.float64)
-  gains = []
+def precompute_singleton_utilities_raw(examples, utility_evaluator):
+  raw_singletons = []
   for ex in examples:
     prompt_passages = ex.get('passages_for_prompt', ex['passages'])
-    doc_gains = np.zeros(len(prompt_passages), dtype=np.float64)
+    doc_utils = np.zeros(len(prompt_passages), dtype=np.float64)
     for i, passage in enumerate(prompt_passages):
-      utility = utility_evaluator.compute_set_utility(
+      doc_utils[i] = utility_evaluator.compute_set_utility(
           ex['question'],
           [passage],
           ex['answer'],
           baseline_key=ex['example_id'])
-      doc_gains[i] = utility * rank_weights[0]
-    transformed = _transform_singleton_gains(doc_gains, singleton_gain_transform)
+    raw_singletons.append(np.asarray(doc_utils, dtype=np.float64))
+  return raw_singletons
+
+
+def transform_singleton_utilities(raw_singletons, singleton_gain_transform):
+  gains = []
+  for raw_utils in raw_singletons:
+    transformed = _transform_singleton_gains(
+        np.asarray(raw_utils, dtype=np.float64),
+        singleton_gain_transform)
     gains.append(np.asarray(transformed, dtype=np.float64))
   return gains
+
+
+def _doc_counts_for_examples(examples):
+  return [len(ex.get('passages_for_prompt', ex['passages'])) for ex in examples]
+
+
+def _doc_count_stats(doc_counts):
+  if not doc_counts:
+    return {'min': 0, 'mean': 0.0, 'max': 0}
+  arr = np.asarray(doc_counts, dtype=np.float64)
+  return {
+      'min': int(np.min(arr)),
+      'mean': float(np.mean(arr)),
+      'max': int(np.max(arr)),
+  }
+
+
+def _save_singleton_cache_npz(raw_singletons, npz_path):
+  lengths = np.asarray([int(np.asarray(x).shape[0]) for x in raw_singletons], dtype=np.int32)
+  if lengths.size == 0:
+    flat = np.zeros((0,), dtype=np.float64)
+  else:
+    flat = np.concatenate([np.asarray(x, dtype=np.float64) for x in raw_singletons], axis=0)
+  np.savez_compressed(npz_path, flat_utilities=flat, lengths=lengths)
+
+
+def _load_singleton_cache_npz(npz_path):
+  with np.load(npz_path) as data:
+    flat = np.asarray(data['flat_utilities'], dtype=np.float64)
+    lengths = np.asarray(data['lengths'], dtype=np.int32)
+  raw_singletons = []
+  offset = 0
+  for length in lengths:
+    length_int = int(length)
+    if length_int < 0:
+      raise ValueError('Invalid negative singleton length in cache: %d' % length_int)
+    raw_singletons.append(np.asarray(flat[offset:offset + length_int], dtype=np.float64))
+    offset += length_int
+  if offset != flat.shape[0]:
+    raise ValueError('Singleton cache flat/length mismatch (%d != %d).' % (offset, flat.shape[0]))
+  return raw_singletons
+
+
+def _validate_singleton_cache_payload(raw_singletons, expected_doc_counts):
+  if len(raw_singletons) != len(expected_doc_counts):
+    raise ValueError(
+        'Singleton cache example count mismatch (%d cached vs %d expected).' % (
+            len(raw_singletons), len(expected_doc_counts)))
+  for i, (arr, expected_count) in enumerate(zip(raw_singletons, expected_doc_counts)):
+    if int(np.asarray(arr).shape[0]) != int(expected_count):
+      raise ValueError(
+          'Singleton cache doc count mismatch at example %d (%d cached vs %d expected).' % (
+              i, int(np.asarray(arr).shape[0]), int(expected_count)))
+
+
+def precompute_singleton_gains(examples, k, utility_evaluator, singleton_gain_transform):
+  del k  # Singleton utilities are independent of cutoff K.
+  raw_singletons = precompute_singleton_utilities_raw(examples, utility_evaluator)
+  return transform_singleton_utilities(raw_singletons, singleton_gain_transform)
 
 
 def evaluate_heldout(model,
@@ -511,6 +577,7 @@ def train_one_method(method_name,
                      singleton_gains,
                      k,
                      num_samples,
+                     minibatch_queries,
                      max_steps,
                      eval_every,
                      eval_examples,
@@ -522,8 +589,12 @@ def train_one_method(method_name,
                      precompute_forward_passes=0,
                      debug_learnability=False):
   rank_weights = np.ones(k, dtype=np.float64)
+  if minibatch_queries < 1:
+    raise ValueError('minibatch_queries must be >= 1, got %d' % minibatch_queries)
   train_q_stream = list(range(len(train_examples)))
   rng = np.random.RandomState(13)
+  rng.shuffle(train_q_stream)
+  train_q_cursor = 0
   prev_params = None
   debug_steps = []
 
@@ -538,14 +609,13 @@ def train_one_method(method_name,
     start = time.perf_counter()
     for step in range(1, max_steps + 1):
       prev_reward_fw = utility_evaluator.reward_forward_passes
-      qid = train_q_stream[(step - 1) % len(train_q_stream)]
-      if step % len(train_q_stream) == 1:
-        rng.shuffle(train_q_stream)
-
-      ex = train_examples[qid]
-      features = ex['features']
-      n_docs = features.shape[0]
-      cutoff = min(k, n_docs)
+      batch_qids = []
+      for _ in range(minibatch_queries):
+        if train_q_cursor >= len(train_q_stream):
+          rng.shuffle(train_q_stream)
+          train_q_cursor = 0
+        batch_qids.append(int(train_q_stream[train_q_cursor]))
+        train_q_cursor += 1
 
       if debug_learnability:
         cur_params = np.concatenate([w.numpy().ravel() for w in model.trainable_variables])
@@ -553,43 +623,83 @@ def train_one_method(method_name,
           prev_params = cur_params.copy()
 
       with tf.GradientTape() as tape:
-        scores_tf = model(features, training=False)
-        np_scores = scores_tf.numpy()[:, 0]
+        query_losses = []
+        query_utilities = []
+        debug_feature_stats = []
+        debug_score_stats = []
+        debug_n_docs = []
+        debug_reward_vectors = []
+        debug_gain_vectors = []
+        debug_doc_weight_vectors = []
 
-        if method_name == 'policygradient':
-          sampled_rankings = pl.gumbel_sample_rankings(np_scores, num_samples, cutoff=cutoff)[0]
-          sampled_rewards = np.array(
-              [utility_evaluator.compute_set_utility(
-                  ex['question'],
-                  get_prompt_passages(ex, ranking[:cutoff]),
-                  ex['answer'],
-                  baseline_key=ex['example_id'])
-               for ranking in sampled_rankings],
-              dtype=np.float64)
-          labels_dummy = np.zeros(n_docs, dtype=np.float64)
-          loss = tf.cast(tfl.policy_gradient(
-              rank_weights[:cutoff],
-              labels_dummy,
-              scores_tf,
-              sampled_rankings=sampled_rankings,
-              sampled_rewards=sampled_rewards), tf.float32)
-          batch_utility = float(np.mean(sampled_rewards))
-        elif method_name == 'plrank_surrogate':
-          gains = singleton_gains[qid]
-          doc_weights = plr.PL_rank_1(
-              rank_weights[:cutoff],
-              gains,
-              np_scores,
-              n_samples=num_samples)
-          loss = -tf.reduce_sum(scores_tf[:, 0] * tf.constant(doc_weights, dtype=tf.float32))
-          ranking = np.argsort(-np_scores)
-          batch_utility = utility_evaluator.compute_set_utility(
-              ex['question'],
-              get_prompt_passages(ex, ranking[:cutoff]),
-              ex['answer'],
-              baseline_key=ex['example_id'])
-        else:
-          raise ValueError('Unknown method: %s' % method_name)
+        for qid in batch_qids:
+          ex = train_examples[qid]
+          features = ex['features']
+          n_docs = features.shape[0]
+          cutoff = min(k, n_docs)
+          scores_tf = model(features, training=False)
+          np_scores = scores_tf.numpy()[:, 0]
+
+          query_util = None
+          if method_name == 'policygradient':
+            sampled_rankings = pl.gumbel_sample_rankings(np_scores, num_samples, cutoff=cutoff)[0]
+            sampled_rewards = np.array(
+                [utility_evaluator.compute_set_utility(
+                    ex['question'],
+                    get_prompt_passages(ex, ranking[:cutoff]),
+                    ex['answer'],
+                    baseline_key=ex['example_id'])
+                 for ranking in sampled_rankings],
+                dtype=np.float64)
+            centered_rewards = sampled_rewards - np.mean(sampled_rewards)
+            labels_dummy = np.zeros(n_docs, dtype=np.float64)
+            query_loss = tf.cast(tfl.policy_gradient(
+                rank_weights[:cutoff],
+                labels_dummy,
+                scores_tf,
+                sampled_rankings=sampled_rankings,
+                sampled_rewards=centered_rewards), tf.float32)
+            query_util = float(np.mean(sampled_rewards))
+            if debug_learnability:
+              debug_reward_vectors.append(sampled_rewards)
+          elif method_name == 'plrank_surrogate':
+            gains = singleton_gains[qid]
+            doc_weights = plr.PL_rank_1(
+                rank_weights[:cutoff],
+                gains,
+                np_scores,
+                n_samples=num_samples)
+            query_loss = -tf.reduce_sum(scores_tf[:, 0] * tf.constant(doc_weights, dtype=tf.float32))
+            ranking = np.argsort(-np_scores)
+            query_util = utility_evaluator.compute_set_utility(
+                ex['question'],
+                get_prompt_passages(ex, ranking[:cutoff]),
+                ex['answer'],
+                baseline_key=ex['example_id'])
+            if debug_learnability:
+              debug_gain_vectors.append(gains)
+              debug_doc_weight_vectors.append(doc_weights)
+          else:
+            raise ValueError('Unknown method: %s' % method_name)
+
+          query_losses.append(query_loss)
+          query_utilities.append(float(query_util))
+          if debug_learnability:
+            debug_n_docs.append(int(n_docs))
+            debug_feature_stats.append((
+                float(np.mean(features)),
+                float(np.std(features)),
+                float(np.min(features)),
+                float(np.max(features)),
+                float(np.mean(features == 0) * 100.0)))
+            debug_score_stats.append((
+                float(np.mean(np_scores)),
+                float(np.std(np_scores)),
+                float(np.min(np_scores)),
+                float(np.max(np_scores))))
+
+        loss = tf.add_n(query_losses) / float(len(query_losses))
+        batch_utility = float(np.mean(query_utilities))
 
       grads = tape.gradient(loss, model.trainable_variables)
       optimizer.apply_gradients(zip(grads, model.trainable_variables))
@@ -602,37 +712,44 @@ def train_one_method(method_name,
         step_debug = {
             'method': method_name,
             'step': step,
-            'qid': qid,
-            'n_docs': n_docs,
-            'feature_mean': float(np.mean(features)),
-            'feature_std': float(np.std(features)),
-            'feature_min': float(np.min(features)),
-            'feature_max': float(np.max(features)),
-            'feature_pct_zero': float(np.mean(features == 0) * 100),
-            'score_mean': float(np.mean(np_scores)),
-            'score_std': float(np.std(np_scores)),
-            'score_min': float(np.min(np_scores)),
-            'score_max': float(np.max(np_scores)),
+            'qid': batch_qids[0],
+            'qids': [int(q) for q in batch_qids],
+            'minibatch_size': len(batch_qids),
+            'n_docs_mean': float(np.mean(debug_n_docs)),
+            'n_docs_min': int(np.min(debug_n_docs)),
+            'n_docs_max': int(np.max(debug_n_docs)),
+            'feature_mean': float(np.mean([s[0] for s in debug_feature_stats])),
+            'feature_std': float(np.mean([s[1] for s in debug_feature_stats])),
+            'feature_min': float(np.min([s[2] for s in debug_feature_stats])),
+            'feature_max': float(np.max([s[3] for s in debug_feature_stats])),
+            'feature_pct_zero': float(np.mean([s[4] for s in debug_feature_stats])),
+            'score_mean': float(np.mean([s[0] for s in debug_score_stats])),
+            'score_std': float(np.mean([s[1] for s in debug_score_stats])),
+            'score_min': float(np.min([s[2] for s in debug_score_stats])),
+            'score_max': float(np.max([s[3] for s in debug_score_stats])),
             'loss': float(loss.numpy()),
             'grad_norm': grad_norm,
             'param_delta_norm': param_delta,
             'batch_utility': float(batch_utility),
         }
         if method_name == 'policygradient':
-          step_debug['reward_mean'] = float(np.mean(sampled_rewards))
-          step_debug['reward_std'] = float(np.std(sampled_rewards))
-          step_debug['reward_min'] = float(np.min(sampled_rewards))
-          step_debug['reward_max'] = float(np.max(sampled_rewards))
+          reward_concat = np.concatenate(debug_reward_vectors)
+          step_debug['reward_mean'] = float(np.mean(reward_concat))
+          step_debug['reward_std'] = float(np.std(reward_concat))
+          step_debug['reward_min'] = float(np.min(reward_concat))
+          step_debug['reward_max'] = float(np.max(reward_concat))
         elif method_name == 'plrank_surrogate':
-          step_debug['singleton_gains_mean'] = float(np.mean(gains))
-          step_debug['singleton_gains_std'] = float(np.std(gains))
-          step_debug['singleton_gains_min'] = float(np.min(gains))
-          step_debug['singleton_gains_max'] = float(np.max(gains))
-          step_debug['doc_weights_mean'] = float(np.mean(doc_weights))
-          step_debug['doc_weights_std'] = float(np.std(doc_weights))
+          gain_concat = np.concatenate(debug_gain_vectors)
+          doc_weight_concat = np.concatenate(debug_doc_weight_vectors)
+          step_debug['singleton_gains_mean'] = float(np.mean(gain_concat))
+          step_debug['singleton_gains_std'] = float(np.std(gain_concat))
+          step_debug['singleton_gains_min'] = float(np.min(gain_concat))
+          step_debug['singleton_gains_max'] = float(np.max(gain_concat))
+          step_debug['doc_weights_mean'] = float(np.mean(doc_weight_concat))
+          step_debug['doc_weights_std'] = float(np.std(doc_weight_concat))
         debug_steps.append(step_debug)
-        print('[DEBUG %s step=%d] feat_dim=%d feat_std=%.4f | score_std=%.4f | loss=%.6f | grad_norm=%.6f | param_delta=%.6f | utility=%.4f' % (
-            method_name, step, features.shape[1], step_debug['feature_std'],
+        print('[DEBUG %s step=%d mb=%d] feat_std=%.4f | score_std=%.4f | loss=%.6f | grad_norm=%.6f | param_delta=%.6f | utility=%.4f' % (
+            method_name, step, len(batch_qids), step_debug['feature_std'],
             step_debug['score_std'], step_debug['loss'], grad_norm, param_delta, batch_utility))
 
       heldout_utility = ''
@@ -730,6 +847,8 @@ def main():
   parser.add_argument('--max_steps', type=int, default=40)
   parser.add_argument('--eval_every', type=int, default=10)
   parser.add_argument('--num_samples', type=int, default=2)
+  parser.add_argument('--minibatch_queries', type=int, default=1,
+                      help='Number of training queries per optimization step.')
   parser.add_argument('--seed', type=int, default=42)
   parser.add_argument('--learning_rate', type=float, default=0.01)
   parser.add_argument('--utility_mode', type=str, default='baseline_subtracted',
@@ -755,6 +874,14 @@ def main():
                       help='Feature normalization: none or per_query_zscore (z-score within each query\'s docs).')
   parser.add_argument('--max_passage_tokens_for_prompt', type=int, default=128,
                       help='Token cap per passage for generator prompts (using generator tokenizer).')
+  parser.add_argument('--max_input_len', type=int, default=512,
+                      help='Max generator input length used by utility evaluator.')
+  parser.add_argument('--max_target_len', type=int, default=64,
+                      help='Max generator target length used by utility evaluator.')
+  parser.add_argument('--singleton_cache_dir', type=str, default='runs/singleton_cache',
+                      help='Directory for cached per-example singleton utilities.')
+  parser.add_argument('--compute_singletons', type=int, default=0, choices=[0, 1],
+                      help='If 1, compute and write singleton utility cache on MISS. If 0, refuse on MISS.')
   parser.add_argument('--preflight_only', type=int, default=0,
                       help='Run sanity checks only (no training). Computes pool hash, top-K baseline, and truncation rates.')
   parser.add_argument('--max_prompt_truncation_rate', type=float, default=0.20,
@@ -815,12 +942,16 @@ def main():
       generator_model=generator_model,
       device=device,
       utility_mode=args.utility_mode,
+      max_input_len=args.max_input_len,
+      max_target_len=args.max_target_len,
       exact_truncation_check=False)
   utility_evaluator_pl = UtilityEvaluator(
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
       utility_mode=args.utility_mode,
+      max_input_len=args.max_input_len,
+      max_target_len=args.max_target_len,
       exact_truncation_check=False)
 
   # --- Data loading uses data_seed (fixed across runs) ---
@@ -915,6 +1046,8 @@ def main():
       generator_model=generator_model,
       device=device,
       utility_mode=args.utility_mode,
+      max_input_len=args.max_input_len,
+      max_target_len=args.max_target_len,
       exact_truncation_check=preflight_only)
   baseline_util, baseline_em, baseline_f1 = evaluate_topk_retriever_baseline(
       val_examples, args.k, utility_evaluator_baseline, tokenizer, generator_model, device)
@@ -939,6 +1072,65 @@ def main():
         'Suggested fixes: reduce --max_passages, shorten passages in corpus/pool, lower prompt length.'
         % (100.0 * baseline_prompt_trunc_rate, 100.0 * args.max_prompt_truncation_rate))
 
+  if candidate_pool_sha256:
+    pool_sha256_for_singleton_cache = candidate_pool_sha256
+  else:
+    # For static Hotpot context pool, tie cache identity to deterministic split IDs.
+    pool_sha256_for_singleton_cache = sha256_json_payload({
+        'source': 'hotpot_qa_context_static_pool',
+        'train_ids_sha256': train_ids_sha256,
+        'val_ids_sha256': val_ids_sha256,
+    })
+
+  singleton_cache_key_fields = {
+      'pool_sha256': pool_sha256_for_singleton_cache,
+      'generator_model': args.generator_model,
+      'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+      'max_input_len': args.max_input_len,
+      'max_target_len': args.max_target_len,
+      'k': args.k,
+  }
+  singleton_cache_key = sha256_json_payload(singleton_cache_key_fields)
+  singleton_cache_path = os.path.join(args.singleton_cache_dir, singleton_cache_key)
+  singleton_cache_npz_path = os.path.join(singleton_cache_path, 'singleton_utilities.npz')
+  singleton_cache_metadata_path = os.path.join(singleton_cache_path, 'metadata.json')
+  singleton_cache_compute_enabled = bool(args.compute_singletons)
+  singleton_cache_expected_doc_counts = _doc_counts_for_examples(train_examples)
+  singleton_cache_status = 'miss'
+  singleton_cache_note = ''
+  singleton_cache_metadata = None
+  singleton_cache_write_created = False
+  raw_singleton_utilities = None
+  print('Singleton cache path: %s' % singleton_cache_path)
+
+  if os.path.exists(singleton_cache_npz_path) and os.path.exists(singleton_cache_metadata_path):
+    try:
+      with open(singleton_cache_metadata_path) as f:
+        singleton_cache_metadata = json.load(f)
+      if singleton_cache_metadata.get('cache_key_fields') != singleton_cache_key_fields:
+        raise ValueError('cache key fields mismatch')
+      if singleton_cache_metadata.get('utility_mode') != args.utility_mode:
+        raise ValueError('utility_mode mismatch (%s cached vs %s requested)' % (
+            singleton_cache_metadata.get('utility_mode'), args.utility_mode))
+      raw_singleton_utilities = _load_singleton_cache_npz(singleton_cache_npz_path)
+      _validate_singleton_cache_payload(raw_singleton_utilities, singleton_cache_expected_doc_counts)
+      singleton_cache_status = 'hit'
+      print('Singleton cache status: HIT')
+    except Exception as exc:
+      singleton_cache_status = 'miss'
+      singleton_cache_note = 'incompatible cache ignored: %s' % str(exc)
+      raw_singleton_utilities = None
+      print('Singleton cache status: MISS (%s)' % singleton_cache_note)
+  else:
+    singleton_cache_status = 'miss'
+    print('Singleton cache status: MISS')
+
+  if (raw_singleton_utilities is None) and (not singleton_cache_compute_enabled):
+    raise ValueError(
+        'Singleton cache MISS at %s.\n'
+        'Refusing to compute singleton utilities because --compute_singletons=0.\n'
+        'Re-run with --compute_singletons 1 to create cache.' % singleton_cache_path)
+
   provenance = {
       'generator_model': args.generator_model,
       'candidate_pool_path': args.candidate_pool_path or 'hotpot_qa_context_static_pool',
@@ -951,12 +1143,28 @@ def main():
       'val_examples': args.val_examples,
       'max_passages': args.max_passages,
       'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+      'max_input_len': args.max_input_len,
+      'max_target_len': args.max_target_len,
       'k': args.k,
       'num_samples': args.num_samples,
+      'minibatch_queries': args.minibatch_queries,
       'utility_mode': args.utility_mode,
       'feature_mode': args.feature_mode,
       'feature_normalize': args.feature_normalize,
       'singleton_gain_transform': args.singleton_gain_transform,
+      'singleton_cache': {
+          'singleton_cache_dir': args.singleton_cache_dir,
+          'cache_key_sha256': singleton_cache_key,
+          'cache_path': singleton_cache_path,
+          'cache_status': singleton_cache_status,
+          'cache_note': singleton_cache_note,
+          'empty_context_baseline_handling': (
+              'Computed on-the-fly by UtilityEvaluator with per-example baseline_key caching.'),
+          'cache_key_fields': singleton_cache_key_fields,
+          'cache_metadata_path': singleton_cache_metadata_path,
+          'cache_npz_path': singleton_cache_npz_path,
+          'compute_singletons': int(singleton_cache_compute_enabled),
+      },
       'prompt_passage_cap_stats': {
           'train': train_cap_stats,
           'val': val_cap_stats,
@@ -985,6 +1193,10 @@ def main():
           'total_generator_forward_passes': 'All generator forward passes used for utility accounting (training utility + empty-context baseline + singleton precompute + held-out eval).',
           'online_generator_forward_passes': 'total_generator_forward_passes - singleton_precompute_forward_passes.',
       },
+      'policygradient_training_note': (
+          'PolicyGradient uses a per-query multi-sample baseline: sampled rewards are centered by '
+          'subtracting the mean reward across the num_samples rankings for the same query before '
+          'computing the policy-gradient loss.'),
   }
   provenance_path = os.path.join(args.output_dir, 'provenance.json')
   with open(provenance_path, 'w') as f:
@@ -993,16 +1205,64 @@ def main():
   with open(preflight_report_path, 'w') as f:
     json.dump(provenance, f, indent=2)
 
-  if preflight_only:
-    print('Preflight PASS: wrote %s' % preflight_report_path)
-    return
+  pl_singleton_precompute_forward_passes = 0
+  if raw_singleton_utilities is None:
+    print('Singleton cache status: MISS -> computing singleton utilities because --compute_singletons=1')
+    os.makedirs(singleton_cache_path, exist_ok=True)
+    singleton_started_utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    singleton_compute_start_fw = utility_evaluator_pl.reward_forward_passes
+    raw_singleton_utilities = precompute_singleton_utilities_raw(
+        train_examples,
+        utility_evaluator=utility_evaluator_pl)
+    pl_singleton_precompute_forward_passes = (
+        utility_evaluator_pl.reward_forward_passes - singleton_compute_start_fw)
+    _validate_singleton_cache_payload(raw_singleton_utilities, singleton_cache_expected_doc_counts)
+    _save_singleton_cache_npz(raw_singleton_utilities, singleton_cache_npz_path)
+    singleton_finished_utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    singleton_cache_metadata = {
+        'cache_key_fields': singleton_cache_key_fields,
+        'cache_key_sha256': singleton_cache_key,
+        'utility_mode': args.utility_mode,
+        'pool_sha256': pool_sha256_for_singleton_cache,
+        'pool_path_used': args.candidate_pool_path or 'hotpot_qa_context_static_pool',
+        'train_ids_sha256': train_ids_sha256,
+        'val_ids_sha256': val_ids_sha256,
+        'num_examples': len(train_examples),
+        'doc_counts': singleton_cache_expected_doc_counts,
+        'doc_count_stats': _doc_count_stats(singleton_cache_expected_doc_counts),
+        'generator_model': args.generator_model,
+        'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+        'max_input_len': args.max_input_len,
+        'max_target_len': args.max_target_len,
+        'k': args.k,
+        'singleton_precompute_forward_passes_when_created': int(pl_singleton_precompute_forward_passes),
+        'created_utc': singleton_started_utc,
+        'written_utc': singleton_finished_utc,
+    }
+    with open(singleton_cache_metadata_path, 'w') as f:
+      json.dump(singleton_cache_metadata, f, indent=2)
+    singleton_cache_status = 'computed'
+    singleton_cache_write_created = True
+    print('Singleton cache write complete: %s' % singleton_cache_path)
+  else:
+    print('Singleton cache status: HIT (loaded singleton utilities; no singleton precompute this run)')
+    pl_singleton_precompute_forward_passes = 0
 
-  singleton_gains = precompute_singleton_gains(
-      train_examples,
-      k=args.k,
-      utility_evaluator=utility_evaluator_pl,
+  singleton_gains = transform_singleton_utilities(
+      raw_singleton_utilities,
       singleton_gain_transform=args.singleton_gain_transform)
-  pl_singleton_precompute_forward_passes = utility_evaluator_pl.reward_forward_passes
+  provenance['singleton_cache']['cache_status'] = singleton_cache_status
+  provenance['singleton_cache']['cache_note'] = singleton_cache_note
+  provenance['singleton_cache']['cache_write_created'] = bool(singleton_cache_write_created)
+  provenance['singleton_cache']['singleton_precompute_forward_passes_this_run'] = int(
+      pl_singleton_precompute_forward_passes)
+  if singleton_cache_metadata is not None:
+    provenance['singleton_cache']['cache_metadata_summary'] = {
+        'num_examples': singleton_cache_metadata.get('num_examples'),
+        'doc_count_stats': singleton_cache_metadata.get('doc_count_stats'),
+        'created_utc': singleton_cache_metadata.get('created_utc'),
+        'written_utc': singleton_cache_metadata.get('written_utc'),
+    }
 
   if args.debug_learnability:
     all_gains = np.concatenate([singleton_gains[i] for i in range(min(5, len(singleton_gains)))])
@@ -1011,6 +1271,12 @@ def main():
           (all_gains.mean(), all_gains.std(), all_gains.min(), all_gains.max()))
     print('  pct_zero=%.2f%%  nonzero=%d/%d' %
           (np.mean(all_gains == 0) * 100, np.count_nonzero(all_gains), len(all_gains)))
+
+  if preflight_only:
+    with open(preflight_report_path, 'w') as f:
+      json.dump(provenance, f, indent=2)
+    print('Preflight PASS: wrote %s' % preflight_report_path)
+    return
 
   # --- Re-seed with training seed before model init and training ---
   random.seed(args.seed)
@@ -1037,6 +1303,7 @@ def main():
       singleton_gains=singleton_gains,
       k=args.k,
       num_samples=args.num_samples,
+      minibatch_queries=args.minibatch_queries,
       max_steps=args.max_steps,
       eval_every=args.eval_every,
       eval_examples=val_examples,
@@ -1055,6 +1322,7 @@ def main():
       singleton_gains=singleton_gains,
       k=args.k,
       num_samples=args.num_samples,
+      minibatch_queries=args.minibatch_queries,
       max_steps=args.max_steps,
       eval_every=args.eval_every,
       eval_examples=val_examples,
@@ -1160,10 +1428,20 @@ def main():
     handle.write('Empty-context baseline uses explicit placeholder: %s\n' % EMPTY_CONTEXT_PLACEHOLDER)
     handle.write('Utility mode: %s\n' % args.utility_mode)
     handle.write('Utility definition: negative mean token NLL; baseline_subtracted uses u(S)=u_raw(S)-u_raw(empty).\n')
+    handle.write(
+        'PolicyGradient variance reduction: per-query multi-sample baseline; sampled rewards are centered '
+        'by subtracting their within-query mean across num_samples rankings.\n')
     handle.write('Singleton gain transform: %s (default/production: shift_min; preserves per-query relative differences while enforcing nonnegativity).\n' % args.singleton_gain_transform)
     handle.write('EM/F1 are approximate normalized metrics (not the official Hotpot script).\n')
     handle.write('Data seed: %d (fixed for data subset selection). Training seed: %d.\n' % (args.data_seed, args.seed))
     handle.write('Passage prompt token cap (generator tokenizer): %d\n' % args.max_passage_tokens_for_prompt)
+    handle.write('Utility evaluator token limits: max_input_len=%d, max_target_len=%d\n' % (
+        args.max_input_len, args.max_target_len))
+    handle.write('Singleton cache path: %s\n' % singleton_cache_path)
+    handle.write('Singleton cache status: %s\n' % singleton_cache_status)
+    handle.write('Singleton cache key SHA256: %s\n' % singleton_cache_key)
+    handle.write('Singleton cache write-created this run: %s\n' % str(bool(singleton_cache_write_created)))
+    handle.write('Singleton empty-context baseline handling: computed on-the-fly with per-example baseline_key cache in UtilityEvaluator.\n')
     handle.write('train_ids.json SHA256: %s\n' % train_ids_sha256)
     handle.write('val_ids.json SHA256: %s\n' % val_ids_sha256)
     handle.write('Preflight baseline prompt truncation: %.2f%% (threshold %.2f%%)\n' % (
