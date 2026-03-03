@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
 import pathlib
@@ -25,6 +26,29 @@ import algorithms.tensorflowloss as tfl
 import utils.plackettluce as pl
 
 EMPTY_CONTEXT_PLACEHOLDER = '<none>'
+
+
+def sha256_file(path):
+  hasher = hashlib.sha256()
+  with open(path, 'rb') as handle:
+    while True:
+      chunk = handle.read(1024 * 1024)
+      if not chunk:
+        break
+      hasher.update(chunk)
+  return hasher.hexdigest()
+
+
+def sha256_json_payload(payload):
+  # Stable JSON serialization ensures deterministic split/provenance hashes.
+  blob = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+  return hashlib.sha256(blob).hexdigest()
+
+
+def safe_rate(numerator, denominator):
+  if denominator <= 0:
+    return 0.0
+  return float(numerator) / float(denominator)
 
 
 class DenseEncoder:
@@ -93,24 +117,59 @@ class UtilityEvaluator(object):
                device,
                utility_mode='baseline_subtracted',
                max_input_len=512,
-               max_target_len=64):
+               max_target_len=64,
+               exact_truncation_check=False):
     self.tokenizer = tokenizer
     self.generator_model = generator_model
     self.device = device
     self.utility_mode = utility_mode
     self.max_input_len = max_input_len
     self.max_target_len = max_target_len
+    self.exact_truncation_check = bool(exact_truncation_check)
     self.reward_forward_passes = 0
     self.prompt_truncation_count = 0
     self.target_truncation_count = 0
     self._empty_baseline_cache = {}
 
   def _tokenize_prompt(self, prompt):
-    toks = self.tokenizer(prompt,
-                          return_tensors='pt',
-                          truncation=True,
-                          max_length=self.max_input_len).to(self.device)
-    was_truncated = toks.input_ids.shape[1] >= self.max_input_len
+    # Try overflow-aware truncation metadata first (fast tokenizer path).
+    was_truncated = False
+    try:
+      meta = self.tokenizer(
+          prompt,
+          truncation=True,
+          max_length=self.max_input_len,
+          return_overflowing_tokens=True)
+      if 'num_truncated_tokens' in meta:
+        num_trunc = meta['num_truncated_tokens']
+        if isinstance(num_trunc, (list, tuple)):
+          num_trunc = num_trunc[0] if num_trunc else 0
+        was_truncated = int(num_trunc) > 0
+      elif 'overflowing_tokens' in meta:
+        overflowing = meta['overflowing_tokens']
+        if isinstance(overflowing, (list, tuple)) and overflowing:
+          first = overflowing[0]
+          if isinstance(first, (list, tuple)):
+            was_truncated = len(first) > 0
+          else:
+            was_truncated = len(overflowing) > 0
+    except Exception:
+      was_truncated = False
+
+    toks = self.tokenizer(
+        prompt,
+        return_tensors='pt',
+        truncation=True,
+        max_length=self.max_input_len).to(self.device)
+    if not was_truncated:
+      if self.exact_truncation_check:
+        full_ids = self.tokenizer(
+            prompt,
+            return_tensors='pt',
+            truncation=False).input_ids
+        was_truncated = int(full_ids.shape[1]) > int(self.max_input_len)
+      else:
+        was_truncated = toks.input_ids.shape[1] >= self.max_input_len
     return toks, was_truncated
 
   def _tokenize_labels(self, gold_answer):
@@ -156,6 +215,44 @@ def build_rag_input(query, passages):
   else:
     context = EMPTY_CONTEXT_PLACEHOLDER
   return 'question: %s\ncontext:\n%s\nanswer:' % (query, context)
+
+
+def cap_passage_for_prompt(tokenizer, passage, max_passage_tokens):
+  if max_passage_tokens is None or max_passage_tokens <= 0:
+    return passage
+  token_ids = tokenizer.encode(
+      passage,
+      add_special_tokens=False,
+      truncation=True,
+      max_length=int(max_passage_tokens))
+  return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+def annotate_prompt_passages(examples, tokenizer, max_passage_tokens):
+  total_raw_chars = 0
+  total_capped_chars = 0
+  total_passages = 0
+  for ex in examples:
+    raw_passages = list(ex['passages'])
+    capped_passages = [
+        cap_passage_for_prompt(tokenizer, passage, max_passage_tokens)
+        for passage in raw_passages
+    ]
+    ex['passages_raw'] = raw_passages
+    ex['passages_for_prompt'] = capped_passages
+    total_passages += len(raw_passages)
+    total_raw_chars += sum(len(p) for p in raw_passages)
+    total_capped_chars += sum(len(p) for p in capped_passages)
+  return {
+      'total_passages': total_passages,
+      'mean_raw_chars': (float(total_raw_chars) / float(total_passages)) if total_passages else 0.0,
+      'mean_capped_chars': (float(total_capped_chars) / float(total_passages)) if total_passages else 0.0,
+  }
+
+
+def get_prompt_passages(ex, indices):
+  src = ex.get('passages_for_prompt', ex['passages'])
+  return [src[i] for i in indices]
 
 
 def generate_answer(query,
@@ -336,8 +433,9 @@ def precompute_singleton_gains(examples, k, utility_evaluator, singleton_gain_tr
   rank_weights = np.ones(k, dtype=np.float64)
   gains = []
   for ex in examples:
-    doc_gains = np.zeros(len(ex['passages']), dtype=np.float64)
-    for i, passage in enumerate(ex['passages']):
+    prompt_passages = ex.get('passages_for_prompt', ex['passages'])
+    doc_gains = np.zeros(len(prompt_passages), dtype=np.float64)
+    for i, passage in enumerate(prompt_passages):
       utility = utility_evaluator.compute_set_utility(
           ex['question'],
           [passage],
@@ -363,7 +461,7 @@ def evaluate_heldout(model,
     scores = model(ex['features'], training=False).numpy()[:, 0]
     ranking = np.argsort(-scores)
     topk = ranking[:min(k, ranking.shape[0])]
-    selected_passages = [ex['passages'][idx] for idx in topk]
+    selected_passages = get_prompt_passages(ex, topk)
     util_vals.append(utility_evaluator.compute_set_utility(
         ex['question'],
         selected_passages,
@@ -387,8 +485,8 @@ def evaluate_topk_retriever_baseline(eval_examples, k, utility_evaluator, tokeni
   em_vals = []
   f1_vals = []
   for ex in eval_examples:
-    topk = list(range(min(k, len(ex['passages']))))
-    selected_passages = [ex['passages'][idx] for idx in topk]
+    topk = list(range(min(k, len(ex.get('passages_for_prompt', ex['passages'])))))
+    selected_passages = get_prompt_passages(ex, topk)
     util_vals.append(utility_evaluator.compute_set_utility(
         ex['question'],
         selected_passages,
@@ -421,6 +519,7 @@ def train_one_method(method_name,
                      generator_model,
                      device,
                      output_csv,
+                     precompute_forward_passes=0,
                      debug_learnability=False):
   rank_weights = np.ones(k, dtype=np.float64)
   train_q_stream = list(range(len(train_examples)))
@@ -432,6 +531,7 @@ def train_one_method(method_name,
     writer = csv.DictWriter(handle, fieldnames=[
         'method', 'step', 'batch_utility', 'heldout_utility', 'heldout_em_approx',
         'heldout_f1_approx', 'reward_forward_passes_step', 'cumulative_reward_forward_passes',
+        'cumulative_total_generator_forward_passes', 'cumulative_online_generator_forward_passes',
         'cumulative_time_ms'])
     writer.writeheader()
 
@@ -461,7 +561,7 @@ def train_one_method(method_name,
           sampled_rewards = np.array(
               [utility_evaluator.compute_set_utility(
                   ex['question'],
-                  [ex['passages'][doc_idx] for doc_idx in ranking[:cutoff]],
+                  get_prompt_passages(ex, ranking[:cutoff]),
                   ex['answer'],
                   baseline_key=ex['example_id'])
                for ranking in sampled_rankings],
@@ -485,7 +585,7 @@ def train_one_method(method_name,
           ranking = np.argsort(-np_scores)
           batch_utility = utility_evaluator.compute_set_utility(
               ex['question'],
-              [ex['passages'][doc_idx] for doc_idx in ranking[:cutoff]],
+              get_prompt_passages(ex, ranking[:cutoff]),
               ex['answer'],
               baseline_key=ex['example_id'])
         else:
@@ -548,6 +648,8 @@ def train_one_method(method_name,
             generator_model,
             device)
       step_reward_forward_passes = utility_evaluator.reward_forward_passes - prev_reward_fw
+      cumulative_total_forward_passes = utility_evaluator.reward_forward_passes
+      cumulative_online_forward_passes = cumulative_total_forward_passes - int(precompute_forward_passes)
 
       writer.writerow({
           'method': method_name,
@@ -557,7 +659,9 @@ def train_one_method(method_name,
           'heldout_em_approx': heldout_em_approx,
           'heldout_f1_approx': heldout_f1_approx,
           'reward_forward_passes_step': step_reward_forward_passes,
-          'cumulative_reward_forward_passes': utility_evaluator.reward_forward_passes,
+          'cumulative_reward_forward_passes': cumulative_total_forward_passes,
+          'cumulative_total_generator_forward_passes': cumulative_total_forward_passes,
+          'cumulative_online_generator_forward_passes': cumulative_online_forward_passes,
           'cumulative_time_ms': (time.perf_counter() - start) * 1000.0,
       })
       handle.flush()
@@ -649,9 +753,35 @@ def main():
   parser.add_argument('--feature_normalize', type=str, default='none',
                       choices=['none', 'per_query_zscore'],
                       help='Feature normalization: none or per_query_zscore (z-score within each query\'s docs).')
+  parser.add_argument('--max_passage_tokens_for_prompt', type=int, default=128,
+                      help='Token cap per passage for generator prompts (using generator tokenizer).')
+  parser.add_argument('--preflight_only', type=int, default=0,
+                      help='Run sanity checks only (no training). Computes pool hash, top-K baseline, and truncation rates.')
+  parser.add_argument('--max_prompt_truncation_rate', type=float, default=0.20,
+                      help='Abort if prompt truncation rate exceeds this threshold (evaluated in preflight baseline).')
+  parser.add_argument('--expected_pool_sha256', type=str, default='',
+                      help='Optional expected SHA256 for --candidate_pool_path. If provided and mismatched, abort.')
   args = parser.parse_args()
 
   os.makedirs(args.output_dir, exist_ok=True)
+  preflight_only = bool(args.preflight_only)
+  expected_pool_sha256 = args.expected_pool_sha256.strip().lower()
+  candidate_pool_sha256 = ''
+  pool_hash_match = 'not_checked'
+  if args.candidate_pool_path:
+    candidate_pool_sha256 = sha256_file(args.candidate_pool_path)
+    pool_hash_match = 'computed_only'
+    print('Candidate pool SHA256: %s' % candidate_pool_sha256)
+    if expected_pool_sha256:
+      pool_hash_match = str(candidate_pool_sha256 == expected_pool_sha256)
+      if candidate_pool_sha256 != expected_pool_sha256:
+        raise ValueError(
+            'Candidate pool hash mismatch.\n'
+            '  expected: %s\n'
+            '  observed: %s\n'
+            'Refusing to continue because pool determinism check failed.'
+            % (expected_pool_sha256, candidate_pool_sha256))
+      print('Candidate pool hash check: PASS')
 
   device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   print('--- Hardware ---')
@@ -684,12 +814,14 @@ def main():
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
-      utility_mode=args.utility_mode)
+      utility_mode=args.utility_mode,
+      exact_truncation_check=False)
   utility_evaluator_pl = UtilityEvaluator(
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
-      utility_mode=args.utility_mode)
+      utility_mode=args.utility_mode,
+      exact_truncation_check=False)
 
   # --- Data loading uses data_seed (fixed across runs) ---
   random.seed(args.data_seed)
@@ -710,6 +842,21 @@ def main():
         val_examples=args.val_examples,
         seed=args.data_seed,
         encoder=encoder)
+
+  train_cap_stats = annotate_prompt_passages(
+      train_examples,
+      tokenizer=tokenizer,
+      max_passage_tokens=args.max_passage_tokens_for_prompt)
+  val_cap_stats = annotate_prompt_passages(
+      val_examples,
+      tokenizer=tokenizer,
+      max_passage_tokens=args.max_passage_tokens_for_prompt)
+  print('Applied passage token cap for prompts: max_passage_tokens_for_prompt=%d' % (
+      args.max_passage_tokens_for_prompt))
+  print('Prompt passage chars (train): mean_raw=%.1f mean_capped=%.1f over %d passages' % (
+      train_cap_stats['mean_raw_chars'], train_cap_stats['mean_capped_chars'], train_cap_stats['total_passages']))
+  print('Prompt passage chars (val): mean_raw=%.1f mean_capped=%.1f over %d passages' % (
+      val_cap_stats['mean_raw_chars'], val_cap_stats['mean_capped_chars'], val_cap_stats['total_passages']))
 
   if args.feature_normalize == 'per_query_zscore':
     eps = 1e-6
@@ -741,19 +888,114 @@ def main():
 
   train_ids = [ex['example_id'] for ex in train_examples]
   val_ids = [ex['example_id'] for ex in val_examples]
-  with open(os.path.join(args.output_dir, 'train_ids.json'), 'w') as f:
-    json.dump(train_ids, f)
-  with open(os.path.join(args.output_dir, 'val_ids.json'), 'w') as f:
-    json.dump(val_ids, f)
+  if not train_ids or not val_ids:
+    raise ValueError('Missing train_ids or val_ids; refusing to run without fixed data splits.')
+  if len(set(train_ids)) != len(train_ids):
+    raise ValueError('Duplicate IDs detected in train split.')
+  if len(set(val_ids)) != len(val_ids):
+    raise ValueError('Duplicate IDs detected in validation split.')
+  if set(train_ids).intersection(set(val_ids)):
+    raise ValueError('Train/val ID overlap detected; split reproducibility is invalid.')
+
+  train_ids_path = os.path.join(args.output_dir, 'train_ids.json')
+  val_ids_path = os.path.join(args.output_dir, 'val_ids.json')
+  with open(train_ids_path, 'w') as f:
+    json.dump(train_ids, f, indent=2)
+  with open(val_ids_path, 'w') as f:
+    json.dump(val_ids, f, indent=2)
+  if not os.path.exists(train_ids_path) or not os.path.exists(val_ids_path):
+    raise ValueError('Missing train_ids.json/val_ids.json after write; aborting.')
+  train_ids_sha256 = sha256_json_payload(train_ids)
+  val_ids_sha256 = sha256_json_payload(val_ids)
+  print('train_ids SHA256: %s' % train_ids_sha256)
+  print('val_ids SHA256:   %s' % val_ids_sha256)
 
   utility_evaluator_baseline = UtilityEvaluator(
       tokenizer=tokenizer,
       generator_model=generator_model,
       device=device,
-      utility_mode=args.utility_mode)
+      utility_mode=args.utility_mode,
+      exact_truncation_check=preflight_only)
   baseline_util, baseline_em, baseline_f1 = evaluate_topk_retriever_baseline(
       val_examples, args.k, utility_evaluator_baseline, tokenizer, generator_model, device)
   print('Top-K retriever baseline: utility=%.4f  EM=%.4f  F1=%.4f' % (baseline_util, baseline_em, baseline_f1))
+  baseline_prompt_trunc_rate = safe_rate(
+      utility_evaluator_baseline.prompt_truncation_count,
+      utility_evaluator_baseline.reward_forward_passes)
+  baseline_target_trunc_rate = safe_rate(
+      utility_evaluator_baseline.target_truncation_count,
+      utility_evaluator_baseline.reward_forward_passes)
+  print('Baseline truncation rates: prompt=%.2f%% target=%.2f%% (%d/%d prompt truncations)' % (
+      100.0 * baseline_prompt_trunc_rate,
+      100.0 * baseline_target_trunc_rate,
+      utility_evaluator_baseline.prompt_truncation_count,
+      utility_evaluator_baseline.reward_forward_passes))
+
+  if baseline_prompt_trunc_rate > args.max_prompt_truncation_rate:
+    raise ValueError(
+        'Prompt truncation sanity gate failed.\n'
+        '  observed prompt truncation rate: %.2f%%\n'
+        '  allowed maximum: %.2f%%\n'
+        'Suggested fixes: reduce --max_passages, shorten passages in corpus/pool, lower prompt length.'
+        % (100.0 * baseline_prompt_trunc_rate, 100.0 * args.max_prompt_truncation_rate))
+
+  provenance = {
+      'generator_model': args.generator_model,
+      'candidate_pool_path': args.candidate_pool_path or 'hotpot_qa_context_static_pool',
+      'candidate_pool_sha256': candidate_pool_sha256,
+      'expected_pool_sha256': expected_pool_sha256,
+      'pool_hash_match': pool_hash_match,
+      'data_seed': args.data_seed,
+      'training_seed': args.seed,
+      'train_examples': args.train_examples,
+      'val_examples': args.val_examples,
+      'max_passages': args.max_passages,
+      'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+      'k': args.k,
+      'num_samples': args.num_samples,
+      'utility_mode': args.utility_mode,
+      'feature_mode': args.feature_mode,
+      'feature_normalize': args.feature_normalize,
+      'singleton_gain_transform': args.singleton_gain_transform,
+      'prompt_passage_cap_stats': {
+          'train': train_cap_stats,
+          'val': val_cap_stats,
+      },
+      'train_ids_path': train_ids_path,
+      'val_ids_path': val_ids_path,
+      'train_ids_sha256': train_ids_sha256,
+      'val_ids_sha256': val_ids_sha256,
+      'topk_retriever_baseline': {
+          'heldout_utility': baseline_util,
+          'heldout_em_approx': baseline_em,
+          'heldout_f1_approx': baseline_f1,
+          'cumulative_total_generator_forward_passes': utility_evaluator_baseline.reward_forward_passes,
+          'cumulative_online_generator_forward_passes': utility_evaluator_baseline.reward_forward_passes,
+          'singleton_precompute_forward_passes': 0,
+      },
+      'preflight': {
+          'prompt_truncation_count': utility_evaluator_baseline.prompt_truncation_count,
+          'target_truncation_count': utility_evaluator_baseline.target_truncation_count,
+          'total_generator_forward_passes': utility_evaluator_baseline.reward_forward_passes,
+          'prompt_truncation_rate': baseline_prompt_trunc_rate,
+          'target_truncation_rate': baseline_target_trunc_rate,
+          'max_prompt_truncation_rate': args.max_prompt_truncation_rate,
+      },
+      'compute_accounting_definition': {
+          'total_generator_forward_passes': 'All generator forward passes used for utility accounting (training utility + empty-context baseline + singleton precompute + held-out eval).',
+          'online_generator_forward_passes': 'total_generator_forward_passes - singleton_precompute_forward_passes.',
+      },
+  }
+  provenance_path = os.path.join(args.output_dir, 'provenance.json')
+  with open(provenance_path, 'w') as f:
+    json.dump(provenance, f, indent=2)
+  preflight_report_path = os.path.join(args.output_dir, 'preflight_report.json')
+  with open(preflight_report_path, 'w') as f:
+    json.dump(provenance, f, indent=2)
+
+  if preflight_only:
+    print('Preflight PASS: wrote %s' % preflight_report_path)
+    return
 
   singleton_gains = precompute_singleton_gains(
       train_examples,
@@ -803,6 +1045,7 @@ def main():
       generator_model=generator_model,
       device=device,
       output_csv=pg_csv,
+      precompute_forward_passes=0,
       debug_learnability=debug)
   pl_debug = train_one_method(
       method_name='plrank_surrogate',
@@ -820,6 +1063,7 @@ def main():
       generator_model=generator_model,
       device=device,
       output_csv=pl_csv,
+      precompute_forward_passes=pl_singleton_precompute_forward_passes,
       debug_learnability=debug)
 
   if debug and (pg_debug or pl_debug):
@@ -844,6 +1088,7 @@ def main():
     writer = csv.DictWriter(handle, fieldnames=[
         'method', 'final_heldout_utility', 'final_heldout_em_approx', 'final_heldout_f1_approx',
         'threshold_utility', 'steps_to_threshold', 'time_ms_to_threshold',
+        'cumulative_total_generator_forward_passes', 'cumulative_online_generator_forward_passes',
         'cumulative_reward_forward_passes', 'singleton_precompute_forward_passes',
         'prompt_truncation_count', 'target_truncation_count'])
     writer.writeheader()
@@ -857,6 +1102,8 @@ def main():
         'threshold_utility': threshold,
         'steps_to_threshold': 'N/A' if pg_step is None else pg_step,
         'time_ms_to_threshold': 'N/A' if pg_ms is None else pg_ms,
+        'cumulative_total_generator_forward_passes': utility_evaluator_pg.reward_forward_passes,
+        'cumulative_online_generator_forward_passes': utility_evaluator_pg.reward_forward_passes,
         'cumulative_reward_forward_passes': utility_evaluator_pg.reward_forward_passes,
         'singleton_precompute_forward_passes': 0,
         'prompt_truncation_count': utility_evaluator_pg.prompt_truncation_count,
@@ -870,6 +1117,9 @@ def main():
         'threshold_utility': threshold,
         'steps_to_threshold': 'N/A' if pl_step is None else pl_step,
         'time_ms_to_threshold': 'N/A' if pl_ms is None else pl_ms,
+        'cumulative_total_generator_forward_passes': utility_evaluator_pl.reward_forward_passes,
+        'cumulative_online_generator_forward_passes': (
+            utility_evaluator_pl.reward_forward_passes - pl_singleton_precompute_forward_passes),
         'cumulative_reward_forward_passes': utility_evaluator_pl.reward_forward_passes,
         'singleton_precompute_forward_passes': pl_singleton_precompute_forward_passes,
         'prompt_truncation_count': utility_evaluator_pl.prompt_truncation_count,
@@ -883,6 +1133,8 @@ def main():
         'threshold_utility': '',
         'steps_to_threshold': 'N/A',
         'time_ms_to_threshold': 'N/A',
+        'cumulative_total_generator_forward_passes': utility_evaluator_baseline.reward_forward_passes,
+        'cumulative_online_generator_forward_passes': utility_evaluator_baseline.reward_forward_passes,
         'cumulative_reward_forward_passes': utility_evaluator_baseline.reward_forward_passes,
         'singleton_precompute_forward_passes': 0,
         'prompt_truncation_count': utility_evaluator_baseline.prompt_truncation_count,
@@ -891,12 +1143,15 @@ def main():
 
   readme_path = os.path.join(args.output_dir, 'README.txt')
   with open(readme_path, 'w') as handle:
+    handle.write('Generator model: %s\n' % args.generator_model)
     if args.candidate_pool_path:
       handle.write('Candidate pool source: %s\n' % args.candidate_pool_path)
+      handle.write('Candidate pool SHA256: %s\n' % candidate_pool_sha256)
       handle.write('Using retrieved passages as fixed top-N candidate pool.\n')
     else:
       handle.write('Static candidate pool note: HotpotQA context passages are used as a fixed top-N candidate pool.\n')
       handle.write('This is not a full retriever pipeline over Wikipedia.\n')
+    handle.write('Pool hash check status: %s\n' % pool_hash_match)
     handle.write('Feature mode: %s\n' % args.feature_mode)
     if args.feature_mode == 'dense':
       handle.write('Encoder model: %s\n' % args.encoder_model)
@@ -908,8 +1163,37 @@ def main():
     handle.write('Singleton gain transform: %s (default/production: shift_min; preserves per-query relative differences while enforcing nonnegativity).\n' % args.singleton_gain_transform)
     handle.write('EM/F1 are approximate normalized metrics (not the official Hotpot script).\n')
     handle.write('Data seed: %d (fixed for data subset selection). Training seed: %d.\n' % (args.data_seed, args.seed))
+    handle.write('Passage prompt token cap (generator tokenizer): %d\n' % args.max_passage_tokens_for_prompt)
+    handle.write('train_ids.json SHA256: %s\n' % train_ids_sha256)
+    handle.write('val_ids.json SHA256: %s\n' % val_ids_sha256)
+    handle.write('Preflight baseline prompt truncation: %.2f%% (threshold %.2f%%)\n' % (
+        100.0 * baseline_prompt_trunc_rate, 100.0 * args.max_prompt_truncation_rate))
+    handle.write('Compute accounting:\n')
+    handle.write('- total_generator_forward_passes includes training utility + empty-context baseline + singleton precompute + held-out eval.\n')
+    handle.write('- online_generator_forward_passes = total_generator_forward_passes - singleton_precompute_forward_passes.\n')
+
+  provenance['run_results'] = {
+      'policygradient': {
+          'cumulative_total_generator_forward_passes': utility_evaluator_pg.reward_forward_passes,
+          'cumulative_online_generator_forward_passes': utility_evaluator_pg.reward_forward_passes,
+          'singleton_precompute_forward_passes': 0,
+          'prompt_truncation_count': utility_evaluator_pg.prompt_truncation_count,
+          'target_truncation_count': utility_evaluator_pg.target_truncation_count,
+      },
+      'plrank_surrogate': {
+          'cumulative_total_generator_forward_passes': utility_evaluator_pl.reward_forward_passes,
+          'cumulative_online_generator_forward_passes': (
+              utility_evaluator_pl.reward_forward_passes - pl_singleton_precompute_forward_passes),
+          'singleton_precompute_forward_passes': pl_singleton_precompute_forward_passes,
+          'prompt_truncation_count': utility_evaluator_pl.prompt_truncation_count,
+          'target_truncation_count': utility_evaluator_pl.target_truncation_count,
+      },
+  }
+  with open(provenance_path, 'w') as f:
+    json.dump(provenance, f, indent=2)
 
   print('Wrote set-utility experiment outputs to %s' % args.output_dir)
+  print('Generator model: %s' % args.generator_model)
   print('Reward forward passes: PG=%d, PL-surrogate=%d' % (
       utility_evaluator_pg.reward_forward_passes, utility_evaluator_pl.reward_forward_passes))
   print('Prompt truncation counts: PG=%d, PL-surrogate=%d' % (
