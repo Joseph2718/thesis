@@ -54,7 +54,7 @@ def safe_rate(numerator, denominator):
 class DenseEncoder:
   """Encodes text into dense embeddings using a sentence-transformers model."""
 
-  def __init__(self, model_name='sentence-transformers/all-MiniLM-L6-v2', device_str='cpu'):
+  def __init__(self, model_name='facebook/contriever', device_str='cpu'):
     from sentence_transformers import SentenceTransformer
     self.model = SentenceTransformer(model_name, device=device_str)
     self.embed_dim = self.model.get_sentence_embedding_dimension()
@@ -64,14 +64,19 @@ class DenseEncoder:
         texts, batch_size=batch_size,
         show_progress_bar=False, normalize_embeddings=True)
 
+  def feature_dim(self):
+    return 4 * self.embed_dim + 1
+
   def featurize(self, query, passages):
     q_emb = self.encode([query])[0]
     if not passages:
-      return np.zeros((0, self.embed_dim + 1), dtype=np.float32)
+      return np.zeros((0, self.feature_dim()), dtype=np.float32)
     p_embs = self.encode(passages)
-    interaction = q_emb[np.newaxis, :] * p_embs
+    q_tile = np.repeat(q_emb[np.newaxis, :], p_embs.shape[0], axis=0)
+    interaction = q_tile * p_embs
+    absdiff = np.abs(q_tile - p_embs)
     cos_sim = (p_embs @ q_emb).reshape(-1, 1)
-    return np.concatenate([interaction, cos_sim], axis=1).astype(np.float32)
+    return np.concatenate([q_tile, p_embs, interaction, absdiff, cos_sim], axis=1).astype(np.float32)
 
 
 def normalize_answer(text):
@@ -859,8 +864,8 @@ def main():
                       choices=['lexical', 'dense'],
                       help='Passage featurization: lexical (4 hand-crafted) or dense (pretrained encoder embeddings).')
   parser.add_argument('--encoder_model', type=str,
-                      default='sentence-transformers/all-MiniLM-L6-v2',
-                      help='Sentence-transformers model for dense features.')
+                      default='facebook/contriever',
+                      help='Sentence-transformers model for dense features (default: contriever for OptiSet-like setup).')
   parser.add_argument('--hidden_units', type=str, default=None,
                       help='Comma-separated hidden layer sizes (default: 64,32 for dense, 32,32 for lexical).')
   parser.add_argument('--dropout', type=float, default=0.0,
@@ -925,12 +930,12 @@ def main():
     enc_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('Loading dense encoder: %s (device=%s)' % (args.encoder_model, enc_device))
     encoder = DenseEncoder(model_name=args.encoder_model, device_str=enc_device)
-    print('Encoder embedding dim: %d -> feature dim: %d' % (encoder.embed_dim, encoder.embed_dim + 1))
+    print('Encoder embedding dim: %d -> feature dim: %d' % (encoder.embed_dim, encoder.feature_dim()))
 
   if args.hidden_units is not None:
     hidden_units = [int(x) for x in args.hidden_units.split(',')]
   elif args.feature_mode == 'dense':
-    hidden_units = [64, 32]
+    hidden_units = [256, 128]
   else:
     hidden_units = [32, 32]
 

@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
   sys.path.insert(0, str(PROJECT_ROOT))
 
 import scripts.set_utility_experiment as sue
+from scripts.set_utility_experiment import load_examples_from_candidate_pool
 
 
 def precompute_singleton_utilities(examples, utility_evaluator):
@@ -341,8 +342,8 @@ def main():
                       choices=['lexical', 'dense'],
                       help='Passage featurization: lexical (4 hand-crafted) or dense (pretrained encoder embeddings).')
   parser.add_argument('--encoder_model', type=str,
-                      default='sentence-transformers/all-MiniLM-L6-v2',
-                      help='Sentence-transformers model for dense features.')
+                      default='facebook/contriever',
+                      help='Sentence-transformers model for dense features (default: contriever for OptiSet-like setup).')
   parser.add_argument('--hidden_units', type=str, default=None,
                       help='Comma-separated hidden layer sizes (default: 64,32 for dense, 32,32 for lexical).')
   parser.add_argument('--dropout', type=float, default=0.0,
@@ -354,6 +355,14 @@ def main():
                       help='Feature normalization: none or per_query_zscore (z-score within each query\'s docs).')
   parser.add_argument('--max_passage_tokens_for_prompt', type=int, default=64,
                       help='Token cap per passage for generator prompts (using generator tokenizer).')
+  parser.add_argument('--max_input_len', type=int, default=512,
+                      help='Max generator input length used by utility evaluator.')
+  parser.add_argument('--max_target_len', type=int, default=64,
+                      help='Max generator target length used by utility evaluator.')
+  parser.add_argument('--singleton_cache_dir', type=str, default='runs/singleton_cache',
+                      help='Directory for cached per-example singleton utilities.')
+  parser.add_argument('--compute_singletons', type=int, default=0, choices=[0, 1],
+                      help='If 1, compute and write singleton utility cache on MISS. If 0, refuse on MISS.')
   parser.add_argument('--expected_pool_sha256', type=str, default='',
                       help='Optional expected SHA256 for --candidate_pool_path. If provided and mismatched, abort.')
   parser.add_argument('--supervised_loss', type=str, default='listwise', choices=['listwise', 'pairwise'])
@@ -404,12 +413,12 @@ def main():
     enc_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('Loading dense encoder: %s (device=%s)' % (args.encoder_model, enc_device))
     encoder = sue.DenseEncoder(model_name=args.encoder_model, device_str=enc_device)
-    print('Encoder embedding dim: %d -> feature dim: %d' % (encoder.embed_dim, encoder.embed_dim + 1))
+    print('Encoder embedding dim: %d -> feature dim: %d' % (encoder.embed_dim, encoder.feature_dim()))
 
   if args.hidden_units is not None:
     hidden_units = [int(x) for x in args.hidden_units.split(',')]
   elif args.feature_mode == 'dense':
-    hidden_units = [64, 32]
+    hidden_units = [256, 128]
   else:
     hidden_units = [32, 32]
 
@@ -421,13 +430,15 @@ def main():
       generator_model=generator_model,
       device=device,
       utility_mode=args.utility_mode,
+      max_input_len=args.max_input_len,
+      max_target_len=args.max_target_len,
       exact_truncation_check=False)
 
   random.seed(args.data_seed)
   np.random.seed(args.data_seed)
   torch.manual_seed(args.data_seed)
   if args.candidate_pool_path:
-    train_examples, val_examples = sue.load_examples_from_candidate_pool(
+    train_examples, val_examples = load_examples_from_candidate_pool(
         candidate_pool_path=args.candidate_pool_path,
         max_passages=args.max_passages,
         train_examples=args.train_examples,
@@ -496,11 +507,86 @@ def main():
   print('train_ids SHA256: %s' % train_ids_sha256)
   print('val_ids SHA256:   %s' % val_ids_sha256)
 
-  print('Precomputing singleton utilities for train/val ...')
-  train_singletons = precompute_singleton_utilities(train_examples, utility_evaluator)
-  val_singletons = precompute_singleton_utilities(val_examples, utility_evaluator)
+  if candidate_pool_sha256:
+    pool_sha256_for_cache = candidate_pool_sha256
+  else:
+    pool_sha256_for_cache = _sha256_json_payload({
+        'source': 'hotpot_qa_context_static_pool',
+        'train_ids_sha256': train_ids_sha256,
+        'val_ids_sha256': val_ids_sha256,
+    })
+
+  def _resolve_singleton_cache(split_name, examples):
+    cache_key_fields = {
+        'pool_sha256': pool_sha256_for_cache,
+        'generator_model': args.generator_model,
+        'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+        'max_input_len': args.max_input_len,
+        'max_target_len': args.max_target_len,
+        'k': args.k,
+        'split': split_name,
+    }
+    cache_key = _sha256_json_payload(cache_key_fields)
+    cache_path = os.path.join(args.singleton_cache_dir, cache_key)
+    npz_path = os.path.join(cache_path, 'singleton_utilities.npz')
+    meta_path = os.path.join(cache_path, 'metadata.json')
+    expected_doc_counts = sue._doc_counts_for_examples(examples)
+    raw = None
+
+    if os.path.exists(npz_path) and os.path.exists(meta_path):
+      try:
+        with open(meta_path) as f:
+          meta = json.load(f)
+        if meta.get('cache_key_fields') != cache_key_fields:
+          raise ValueError('cache key fields mismatch')
+        if meta.get('utility_mode') != args.utility_mode:
+          raise ValueError('utility_mode mismatch')
+        raw = sue._load_singleton_cache_npz(npz_path)
+        sue._validate_singleton_cache_payload(raw, expected_doc_counts)
+        print('Singleton cache [%s]: HIT at %s' % (split_name, cache_path))
+        return raw, 0
+      except Exception as exc:
+        print('Singleton cache [%s]: MISS (incompatible: %s)' % (split_name, exc))
+    else:
+      print('Singleton cache [%s]: MISS at %s' % (split_name, cache_path))
+
+    if not bool(args.compute_singletons):
+      raise ValueError(
+          'Singleton cache MISS for %s at %s.\n'
+          'Refusing to compute because --compute_singletons=0.\n'
+          'Re-run with --compute_singletons 1 to create cache.'
+          % (split_name, cache_path))
+
+    print('Singleton cache [%s]: computing ...' % split_name)
+    os.makedirs(cache_path, exist_ok=True)
+    start_fw = utility_evaluator.reward_forward_passes
+    raw = sue.precompute_singleton_utilities_raw(examples, utility_evaluator)
+    fw_used = utility_evaluator.reward_forward_passes - start_fw
+    sue._validate_singleton_cache_payload(raw, expected_doc_counts)
+    sue._save_singleton_cache_npz(raw, npz_path)
+    meta = {
+        'cache_key_fields': cache_key_fields,
+        'cache_key_sha256': cache_key,
+        'utility_mode': args.utility_mode,
+        'num_examples': len(examples),
+        'doc_counts': expected_doc_counts,
+        'doc_count_stats': sue._doc_count_stats(expected_doc_counts),
+        'generator_model': args.generator_model,
+        'max_passage_tokens_for_prompt': args.max_passage_tokens_for_prompt,
+        'max_input_len': args.max_input_len,
+        'max_target_len': args.max_target_len,
+        'k': args.k,
+    }
+    with open(meta_path, 'w') as f:
+      json.dump(meta, f, indent=2)
+    print('Singleton cache [%s]: wrote %s (%d forward passes)' % (split_name, cache_path, fw_used))
+    return raw, fw_used
+
+  train_singletons, train_fw = _resolve_singleton_cache('train', train_examples)
+  val_singletons, val_fw = _resolve_singleton_cache('val', val_examples)
   singleton_precompute_forward_passes = utility_evaluator.reward_forward_passes
-  print('Singleton precompute forward passes: %d' % singleton_precompute_forward_passes)
+  print('Singleton precompute forward passes this run: %d (train=%d, val=%d)' % (
+      train_fw + val_fw, train_fw, val_fw))
 
   print('Evaluating retriever baseline + oracle diagnostics ...')
   fixed = evaluate_fixed_methods(
