@@ -54,7 +54,7 @@ def safe_rate(numerator, denominator):
 class DenseEncoder:
   """Encodes text into dense embeddings using a sentence-transformers model."""
 
-  def __init__(self, model_name='facebook/contriever', device_str='cpu'):
+  def __init__(self, model_name='facebook/contriever', device_str=None):
     from sentence_transformers import SentenceTransformer
     self.model = SentenceTransformer(model_name, device=device_str)
     self.embed_dim = self.model.get_sentence_embedding_dimension()
