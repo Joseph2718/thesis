@@ -845,8 +845,8 @@ def main():
   parser.add_argument('--candidate_pool_path', type=str, default=None,
                       help='Optional JSONL retrieval pool. If set, uses retrieved passages instead of Hotpot context passages.')
   parser.add_argument('--generator_model', type=str, default='google/flan-t5-small')
-  parser.add_argument('--train_examples', type=int, default=200)
-  parser.add_argument('--val_examples', type=int, default=80)
+  parser.add_argument('--train_examples', type=int, required=True)
+  parser.add_argument('--val_examples', type=int, required=True)
   parser.add_argument('--max_passages', type=int, default=20)
   parser.add_argument('--k', type=int, default=5)
   parser.add_argument('--max_steps', type=int, default=40)
@@ -1094,6 +1094,7 @@ def main():
       'max_input_len': args.max_input_len,
       'max_target_len': args.max_target_len,
       'k': args.k,
+      'split': 'train',
   }
   singleton_cache_key = sha256_json_payload(singleton_cache_key_fields)
   singleton_cache_path = os.path.join(args.singleton_cache_dir, singleton_cache_key)

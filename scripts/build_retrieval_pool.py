@@ -35,6 +35,14 @@ def _read_corpus(corpus_path, max_docs=None):
   return docs
 
 
+def _passage_text(doc):
+  if doc.get('title'):
+    return '%s: %s' % (doc['title'], doc['text'])
+  return doc['text']
+
+
+# ---------- BM25 ----------
+
 def _build_bm25_index(docs):
   postings = {}
   doc_lens = np.zeros(len(docs), dtype=np.float64)
@@ -71,6 +79,35 @@ def _bm25_retrieve(query, docs, postings, doc_lens, avgdl, top_n, k1=0.9, b=0.4)
   return cand, scores[cand]
 
 
+# ---------- Contriever ----------
+
+def _build_contriever_index(docs, model_name, batch_size, device):
+  from sentence_transformers import SentenceTransformer
+  print('Loading Contriever model: %s (device=%s)' % (model_name, device or 'auto'))
+  model = SentenceTransformer(model_name, device=device)
+  texts = [_passage_text(d) for d in docs]
+  print('Encoding %d corpus passages (batch_size=%d)...' % (len(texts), batch_size))
+  embeddings = model.encode(texts, batch_size=batch_size, show_progress_bar=True,
+                            normalize_embeddings=True)
+  embeddings = np.asarray(embeddings, dtype=np.float32)
+  return model, embeddings
+
+
+def _contriever_retrieve(query, model, corpus_embeddings, top_n):
+  q_emb = model.encode([query], normalize_embeddings=True)
+  q_emb = np.asarray(q_emb, dtype=np.float32)
+  scores = (corpus_embeddings @ q_emb.T).squeeze(1)
+  if top_n >= scores.shape[0]:
+    cand = np.arange(scores.shape[0])
+  else:
+    cand = np.argpartition(scores, -top_n)[-top_n:]
+  cand = sorted(cand.tolist(), key=lambda i: -scores[i])
+  cand = cand[:top_n]
+  return cand, scores[cand].tolist()
+
+
+# ---------- Common ----------
+
 def _load_hotpot_questions(train_examples, val_examples, seed):
   raw = load_dataset('hotpot_qa', 'distractor', split='train').shuffle(seed=seed)
   picked = raw.select(range(train_examples + val_examples))
@@ -86,28 +123,39 @@ def _load_hotpot_questions(train_examples, val_examples, seed):
   return rows
 
 
-def _default_output_path(corpus_path, top_n, train_examples, val_examples, seed):
+def _default_output_path(retriever, corpus_path, top_n, train_examples, val_examples, seed):
   corpus_tag = pathlib.Path(corpus_path).stem
   return os.path.join(
       'data', 'retrieval_pools',
-      'hotpotqa_bm25_top%d_train%d_val%d_seed%d_%s.jsonl' % (
-          top_n, train_examples, val_examples, seed, corpus_tag))
+      'hotpotqa_%s_top%d_train%d_val%d_seed%d_%s.jsonl' % (
+          retriever, top_n, train_examples, val_examples, seed, corpus_tag))
 
 
 def main():
-  parser = argparse.ArgumentParser()
+  parser = argparse.ArgumentParser(
+      description='Build a retrieval pool (BM25 or Contriever) for HotpotQA.')
   parser.add_argument('--corpus_path', required=True, type=str)
+  parser.add_argument('--retriever', type=str, default='bm25',
+                      choices=['bm25', 'contriever'],
+                      help='Retrieval method: bm25 or contriever.')
+  parser.add_argument('--contriever_model', type=str, default='facebook/contriever-msmarco',
+                      help='HuggingFace model name for Contriever retrieval.')
+  parser.add_argument('--encode_batch_size', type=int, default=256,
+                      help='Batch size for Contriever corpus encoding.')
+  parser.add_argument('--device', type=str, default=None,
+                      help='Device for Contriever (None=auto, cuda, cpu, mps).')
   parser.add_argument('--output_path', type=str, default=None)
   parser.add_argument('--top_n', type=int, default=20)
-  parser.add_argument('--train_examples', type=int, default=200)
-  parser.add_argument('--val_examples', type=int, default=80)
+  parser.add_argument('--train_examples', type=int, required=True)
+  parser.add_argument('--val_examples', type=int, required=True)
   parser.add_argument('--seed', type=int, default=42)
   parser.add_argument('--max_corpus_docs', type=int, default=None)
   parser.add_argument('--overwrite', action='store_true')
   args = parser.parse_args()
 
   output_path = args.output_path or _default_output_path(
-      args.corpus_path, args.top_n, args.train_examples, args.val_examples, args.seed)
+      args.retriever, args.corpus_path, args.top_n,
+      args.train_examples, args.val_examples, args.seed)
   out_dir = os.path.dirname(output_path)
   if out_dir:
     os.makedirs(out_dir, exist_ok=True)
@@ -116,33 +164,45 @@ def main():
     return
 
   docs = _read_corpus(args.corpus_path, max_docs=args.max_corpus_docs)
-  postings, doc_lens, avgdl = _build_bm25_index(docs)
   examples = _load_hotpot_questions(args.train_examples, args.val_examples, args.seed)
 
+  if args.retriever == 'bm25':
+    postings, doc_lens, avgdl = _build_bm25_index(docs)
+    print('BM25 index built: %d docs, avgdl=%.1f' % (len(docs), avgdl))
+
+    def retrieve(query):
+      idx, scores = _bm25_retrieve(query, docs, postings, doc_lens, avgdl, args.top_n)
+      return idx, [float(s) for s in scores]
+
+  elif args.retriever == 'contriever':
+    model, corpus_embs = _build_contriever_index(
+        docs, args.contriever_model, args.encode_batch_size, args.device)
+
+    def retrieve(query):
+      return _contriever_retrieve(query, model, corpus_embs, args.top_n)
+
+  print('Retrieving top-%d for %d examples...' % (args.top_n, len(examples)))
   with open(output_path, 'w') as handle:
-    for ex in examples:
-      top_idx, top_scores = _bm25_retrieve(
-          ex['question'],
-          docs,
-          postings,
-          doc_lens,
-          avgdl,
-          top_n=args.top_n)
+    for i, ex in enumerate(examples):
+      top_idx, top_scores = retrieve(ex['question'])
       out = {
           'example_id': ex['example_id'],
           'split': ex['split'],
           'question': ex['question'],
           'gold_answer': ex['gold_answer'],
-          'passages': [('%s: %s' % (docs[i]['title'], docs[i]['text']) if docs[i].get('title') else docs[i]['text']) for i in top_idx],
-          'doc_ids': [docs[i]['doc_id'] for i in top_idx],
-          'scores': [float(s) for s in top_scores],
-          'retriever': 'bm25',
+          'passages': [_passage_text(docs[j]) for j in top_idx],
+          'doc_ids': [docs[j]['doc_id'] for j in top_idx],
+          'scores': top_scores,
+          'retriever': args.retriever,
           'top_n': args.top_n,
       }
       handle.write(json.dumps(out) + '\n')
+      if (i + 1) % 100 == 0:
+        print('  %d / %d queries done' % (i + 1, len(examples)))
 
   print('Wrote retrieval pool to %s' % output_path)
-  print('Examples: %d, top_n: %d, corpus docs: %d' % (len(examples), args.top_n, len(docs)))
+  print('Retriever: %s, examples: %d, top_n: %d, corpus docs: %d' % (
+      args.retriever, len(examples), args.top_n, len(docs)))
 
 
 if __name__ == '__main__':

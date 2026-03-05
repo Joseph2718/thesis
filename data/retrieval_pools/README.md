@@ -22,8 +22,10 @@ Each retrieval pool JSONL record has:
 
 ## Retriever options
 
-- BM25: `scripts/build_retrieval_pool_bm25.py`
-- Contriever (optional): `scripts/build_retrieval_pool_contriever.py`
+Both retrievers are supported by `scripts/build_retrieval_pool.py` via `--retriever`:
+
+- BM25: `--retriever bm25` (default)
+- Contriever: `--retriever contriever` (uses `facebook/contriever-msmarco` by default)
 
 ## Reproducibility and caching
 

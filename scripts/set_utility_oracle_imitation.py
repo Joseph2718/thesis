@@ -327,8 +327,8 @@ def main():
   parser.add_argument('--candidate_pool_path', type=str, default=None,
                       help='Optional JSONL retrieval pool. If set, uses retrieved passages instead of Hotpot context passages.')
   parser.add_argument('--generator_model', type=str, default='google/flan-t5-small')
-  parser.add_argument('--train_examples', type=int, default=200)
-  parser.add_argument('--val_examples', type=int, default=80)
+  parser.add_argument('--train_examples', type=int, required=True)
+  parser.add_argument('--val_examples', type=int, required=True)
   parser.add_argument('--max_passages', type=int, default=20)
   parser.add_argument('--k', type=int, default=5)
   parser.add_argument('--max_steps', type=int, default=200)
